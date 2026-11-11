@@ -1,0 +1,29 @@
+# Build output
+*.asi
+*.exe
+*.dll
+*.lib
+*.pdb
+*.obj
+*.exp
+*.ilk
+zig-cache/
+.zig-cache/
+zig-out/
+
+# Mod runtime files (logs, captures, user settings, backups)
+*.log
+capture-*.bmp
+*.ini
+DualWindowsV2Backup/
+*.asi.disabled
+
+# Release archives (attach to GitHub Releases instead)
+*.zip
+
+# Editors / OS
+.vs/
+.vscode/
+*.user
+Thumbs.db
+desktop.ini
