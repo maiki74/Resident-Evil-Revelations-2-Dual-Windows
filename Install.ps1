@@ -59,7 +59,7 @@ Copy-Item -LiteralPath $payload -Destination $plugin -Force
 $uninstaller=Join-Path $PSScriptRoot 'Uninstall_DualWindows.cmd'
 if(Test-Path -LiteralPath $uninstaller){Copy-Item -LiteralPath $uninstaller -Destination (Join-Path $scripts 'Uninstall_DualWindows.cmd') -Force}
 [IO.File]::WriteAllText($config,$text,[Text.Encoding]::ASCII)
-Write-Output "DualWindows v0.6.0 installed in $game. Launch through Steam."
+Write-Output "DualWindows v0.6.1 installed in $game. Launch through Steam."
 
 
 

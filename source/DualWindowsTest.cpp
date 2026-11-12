@@ -34,7 +34,7 @@ int main() {
     for(int frame=0;frame<600&&!quit;++frame) {
         MSG msg;while(PeekMessage(&msg,0,0,0,PM_REMOVE)){if(msg.message==WM_QUIT)quit=true;TranslateMessage(&msg);DispatchMessage(&msg);}
         if(frame==40) {
-            output=FindWindowW(L"Rev2DualWindowsV2",L"RE Revelations 2 \u2014 Display 1 (v0.6.0)");
+            output=FindWindowW(L"Rev2DualWindowsV2",L"RE Revelations 2 \u2014 Display 1 (v0.6.1)");
             if(output) PostMessageW(output,WM_SYSCOMMAND,0x1120,0);
         }
         if(frame==60&&output) {

@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.6.1: freeze diagnostics (two monitors and minimize)
+
+- New: the log now records every monitor and graphics adapter, which monitor the game and each player window use, swap-chain and device-reset results, and the last startup stage reached.
+- New: freeze watchdog. If a game window stops responding, the mod logs the stuck thread's call stack and saves one small dump file (`ResidentEvilRevelations2.DualWindows.hang1.dmp`) next to the log. It only watches; it never touches the game's windows.
+- Tested: started with two monitors (1920x1080 each), one player window on each monitor, no freeze in that run.
+- Known issue (not fixed): the game may still freeze when minimized, and some earlier two-monitor starts froze on the first loading screen. The cause is not confirmed yet. If it happens, please send the log and the .dmp file.
+- No gameplay, input or window behavior changed from v0.6.0.
+
 ## v0.6.0: MAJOR UPDATE, independent mouse + keyboard and controller for dual-screen co-op
 
 ### Highlight

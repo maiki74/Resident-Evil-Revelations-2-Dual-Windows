@@ -51,6 +51,7 @@ static void Log(const char* text, unsigned a=0, unsigned b=0) {
     FILE* f=nullptr; _wfopen_s(&f,logPath,L"a");
     if(f) { fprintf(f,"%llu: ",GetTickCount64()); fprintf(f,text,a,b); fputc('\n',f); fclose(f); }
 }
+#include "Diagnostics.h"
 static int GameMode();
 // F1: swap which character each display's controllers drive, and swap the two output windows.
 static std::atomic<bool> swapPlayers{false};
@@ -275,6 +276,7 @@ static LRESULT CALLBACK ViewProc(HWND h,UINT msg,WPARAM w,LPARAM l) {
     }
     if(msg==WM_CLOSE) {enabled=false;ShowWindow(views[0],SW_HIDE);ShowWindow(views[1],SW_HIDE);return 0;}
     if(msg==WM_ERASEBKGND) return 1;
+    if(msg==WM_DISPLAYCHANGE&&h==views[0]) {LogF("Display change: %ux%u, monitors %d",LOWORD(l),HIWORD(l),GetSystemMetrics(SM_CMONITORS));}
     if(msg==WM_DPICHANGED&&!monitorFilled[ViewIndex(h)]) {
         const auto& r=*reinterpret_cast<const RECT*>(l);
         SetWindowPos(h,nullptr,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_NOZORDER);
@@ -290,7 +292,7 @@ static LRESULT CALLBACK ViewProc(HWND h,UINT msg,WPARAM w,LPARAM l) {
             SetWindowLongPtrW(gameWindow,GWL_STYLE,(style&~(WS_OVERLAPPEDWINDOW|WS_MAXIMIZE))|WS_POPUP|WS_VISIBLE);
             SetWindowPos(gameWindow,nullptr,m.left,m.top,m.right-m.left,m.bottom-m.top,
                 SWP_NOZORDER|SWP_NOACTIVATE|SWP_FRAMECHANGED|SWP_ASYNCWINDOWPOS);
-            Log("Game window made borderless: %u x %u",m.right-m.left,m.bottom-m.top);
+            Log("Game window made borderless: %u x %u",m.right-m.left,m.bottom-m.top); LogWindow("Game window",gameWindow);
         }
         return 0;
     }
@@ -330,7 +332,7 @@ static DWORD WINAPI WindowLoop(void*) {
         RECT r={0,0,width,width*9/16}; AdjustWindowRectEx(&r,WS_OVERLAPPEDWINDOW,FALSE,WS_EX_NOACTIVATE);
         int x=area.left+12+(monitors.size()>1?0:i*available/2);
         views[i]=CreateWindowExW(WS_EX_NOACTIVATE,L"Rev2DualWindowsV2",
-            i?L"RE Revelations 2 — Display 2 (v0.6.0)":L"RE Revelations 2 — Display 1 (v0.6.0)",   // same names as the dashboard
+            i?L"RE Revelations 2 — Display 2 (v0.6.1)":L"RE Revelations 2 — Display 1 (v0.6.1)",   // same names as the dashboard
             WS_OVERLAPPEDWINDOW,x,area.top+30,r.right-r.left,r.bottom-r.top,gameWindow,nullptr,selfModule,nullptr);
         if(!views[i])return 2;
         if(HMENU menu=GetSystemMenu(views[i],FALSE)) {
@@ -346,6 +348,7 @@ static DWORD WINAPI WindowLoop(void*) {
     }
     SetTimer(views[0],1,1000,nullptr);
     Log("Output window thread ready: %u",GetCurrentThreadId());
+    LogWindow("Display 1 window",views[0]); LogWindow("Display 2 window",views[1]); Stage("output windows ready");
     uiReady.store(true,std::memory_order_release);
     MSG msg;while(GetMessageW(&msg,nullptr,0,0)>0){TranslateMessage(&msg);DispatchMessageW(&msg);}
     return 0;
@@ -355,6 +358,7 @@ static bool MakeWindows(IDirect3DDevice9* device) {
     if(!uiThread) {
         D3DDEVICE_CREATION_PARAMETERS cp={}; if(FAILED(device->GetCreationParameters(&cp)))return false;
         gameWindow=cp.hFocusWindow;
+        LogWindow("Game window",gameWindow); Stage("creating output windows");
         uiThread=CreateThread(nullptr,0,WindowLoop,nullptr,0,&uiThreadId);
         Log("Render thread: %u; game window thread: %u",GetCurrentThreadId(),GetWindowThreadProcessId(gameWindow,nullptr));
     }
@@ -399,7 +403,8 @@ static bool EnsureChain(IDirect3DDevice9* d,int i,D3DFORMAT format) {
     pp.PresentationInterval=D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr=d->CreateAdditionalSwapChain(&pp,&chains[i]);
     static HRESULT lastError=S_OK;
-    if(FAILED(hr)) { if(hr!=lastError) Log("CreateAdditionalSwapChain failed %08x",hr); lastError=hr; return false; }
+    if(FAILED(hr)) { if(hr!=lastError) LogF("CreateAdditionalSwapChain %d failed %08lx (window monitor %p)",i,hr,(void*)MonitorFromWindow(views[i],MONITOR_DEFAULTTONULL)); lastError=hr; return false; }
+    LogF("Swap chain %d created: %ux%u for window %p on monitor %p",i,w,h,(void*)views[i],(void*)MonitorFromWindow(views[i],MONITOR_DEFAULTTONULL));
     lastError=S_OK;
     chainW[i]=w; chainH[i]=h; return true;
 }
@@ -410,6 +415,7 @@ static void LogInputState();
 static void DrawViews(IDirect3DDevice9* d) {
     ++frames;
     if(frames==1) {
+        Stage("first frame");
         IDirect3DSurface9* initial=nullptr;
         if(SUCCEEDED(d->GetBackBuffer(0,0,D3DBACKBUFFER_TYPE_MONO,&initial))) {
             D3DSURFACE_DESC ds;initial->GetDesc(&ds);Log("Initial backbuffer %u x %u",ds.Width,ds.Height);initial->Release();
@@ -532,7 +538,9 @@ static void DrawViews(IDirect3DDevice9* d) {
         }
         if(capture) SaveSurface(d,dest,i?L"capture-player2.bmp":L"capture-player1.bmp");
         dest->Release();
+        renderSpot=i?"player 2 window Present":"player 1 window Present";
         if(SUCCEEDED(hr)) hr=chains[i]->Present(nullptr,nullptr,nullptr,nullptr,0);
+        renderSpot="DrawViews";
         if(SUCCEEDED(hr)) ++successes;
         else if(frames%120==0) Log("Player %u presentation failed %08x",i+1,hr);
     }
@@ -548,8 +556,9 @@ static void DrawViews(IDirect3DDevice9* d) {
 }
 static HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* d,const RECT* a,const RECT* b,HWND h,const RGNDATA* r) {
     bool outer=presentDepth++==0;
-    if(outer) DrawViews(d);
+    if(outer) {renderThreadId=GetCurrentThreadId(); renderSpot="DrawViews"; DrawViews(d); renderSpot="game Present";}
     HRESULT hr=realPresent(d,a,b,h,r);
+    if(outer) renderSpot="game frame (outside Present)";
     --presentDepth;
     if(outer) AttachDevice(d);
     return hr;
@@ -582,12 +591,14 @@ static HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* d,D3DPRESENT_PARAME
     KeepWindowed(pp);
     if(!testMode&&SameAsNow(d,pp)) {ReleaseChains(); Log("Device reset skipped: same windowed mode %u x %u",pp->BackBufferWidth,pp->BackBufferHeight); return D3D_OK;}
     ReleaseChains(); Log("Device reset: %u x %u",pp->BackBufferWidth,pp->BackBufferHeight);
-    return realReset(d,pp);
+    Stage("device Reset"); const HRESULT hr=realReset(d,pp); LogF("Device reset result %08lx",hr); stage="device reset done";
+    return hr;
 }
 static HRESULT STDMETHODCALLTYPE ObjectPresent(IDirect3DDevice9* d,const RECT* a,const RECT* b,HWND h,const RGNDATA* r) {
     bool outer=presentDepth++==0;
-    if(outer) DrawViews(d);
+    if(outer) {renderThreadId=GetCurrentThreadId(); renderSpot="DrawViews"; DrawViews(d); renderSpot="game Present";}
     HRESULT hr=objectPresent(d,a,b,h,r);
+    if(outer) renderSpot="game frame (outside Present)";
     --presentDepth;
     if(outer) AttachDevice(d);
     return hr;
@@ -595,7 +606,7 @@ static HRESULT STDMETHODCALLTYPE ObjectPresent(IDirect3DDevice9* d,const RECT* a
 static HRESULT STDMETHODCALLTYPE ObjectReset(IDirect3DDevice9* d,D3DPRESENT_PARAMETERS* pp) {
     ReleaseChains();Log("Object device reset %u x %u",pp->BackBufferWidth,pp->BackBufferHeight); KeepWindowed(pp);
     if(!testMode&&SameAsNow(d,pp)) {Log("Device reset skipped: same windowed mode"); AttachDevice(d); return D3D_OK;}
-    HRESULT hr=objectReset(d,pp); if(FAILED(hr)) Log("Device reset failed %08x",hr); AttachDevice(d);return hr;
+    Stage("device Reset"); HRESULT hr=objectReset(d,pp); LogF("Device reset result %08lx",hr); stage="device reset done"; AttachDevice(d);return hr;
 }
 static void AttachDevice(IDirect3DDevice9* d) {
     void** vt=*(void***)d;
@@ -917,8 +928,12 @@ using CreateDeviceFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3D9*,UINT,D3DDEVTYPE,HW
 static CreateDeviceFn realCreateDevice;
 static HRESULT STDMETHODCALLTYPE HookCreateDevice(IDirect3D9* api,UINT a,D3DDEVTYPE t,HWND w,DWORD f,D3DPRESENT_PARAMETERS* pp,IDirect3DDevice9** d) {
     if(pp&&!testMode) KeepWindowed(pp);
+    if(pp) LogF("Game CreateDevice: adapter %u (monitor %p), flags %08lx, %ux%u, device window %p",a,(void*)api->GetAdapterMonitor(a),f,
+                pp->BackBufferWidth,pp->BackBufferHeight,(void*)pp->hDeviceWindow);
+    if(w) LogWindow("Game focus window",w);
+    Stage("game CreateDevice");
     const HRESULT hr=realCreateDevice(api,a,t,w,f,pp,d);
-    Log("Game device created: result %08x",hr);
+    Log("Game device created: result %08x",hr); Stage("game device created");
     return hr;
 }
 static DWORD WINAPI Initialize(void*) {
@@ -927,11 +942,12 @@ static DWORD WINAPI Initialize(void*) {
     wchar_t* tail=wcsrchr(logPath,L'.'); if(tail) wcscpy_s(tail,MAX_PATH-(tail-logPath),L".log");
     wchar_t exe[MAX_PATH];GetModuleFileNameW(nullptr,exe,MAX_PATH);
     testMode=wcsstr(exe,L"DualWindowsTest.exe")!=nullptr;
-    Log("DualWindows prototype 0.6.0 initializing");
+    Log("DualWindows prototype 0.6.1 initializing");
     WNDCLASSW wc={};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=selfModule;wc.lpszClassName=L"Rev2DualProbe";
     RegisterClassW(&wc);
     HWND probe=CreateWindowW(wc.lpszClassName,L"",WS_OVERLAPPED,0,0,32,32,nullptr,nullptr,selfModule,nullptr);
     IDirect3D9* api=Direct3DCreate9(D3D_SDK_VERSION); IDirect3DDevice9* d=nullptr;
+    LogDisplays(api);
     D3DPRESENT_PARAMETERS pp={};pp.Windowed=TRUE;pp.SwapEffect=D3DSWAPEFFECT_DISCARD;pp.hDeviceWindow=probe;
     pp.BackBufferWidth=32;pp.BackBufferHeight=32;pp.BackBufferFormat=D3DFMT_X8R8G8B8;
     HRESULT hr=api?api->CreateDevice(D3DADAPTER_DEFAULT,D3DDEVTYPE_HAL,probe,D3DCREATE_SOFTWARE_VERTEXPROCESSING,&pp,&d):E_FAIL;
@@ -944,7 +960,7 @@ static DWORD WINAPI Initialize(void*) {
         if(m==MH_OK&&!testMode&&MH_CreateHook((*(void***)api)[16],HookCreateDevice,(void**)&realCreateDevice)!=MH_OK) Log("CreateDevice hook failed");
         if(m==MH_OK && MH_CreateHook(vt[17],HookPresent,(void**)&realPresent)==MH_OK &&
             MH_CreateHook(vt[16],HookReset,(void**)&realReset)==MH_OK && MH_EnableHook(MH_ALL_HOOKS)==MH_OK)
-            Log("D3D9 Present/Reset hooks ready");
+            {Log("D3D9 Present/Reset hooks ready"); stage="hooks ready, waiting for the game's device";}
         else Log("Hook initialization failed");
         d->Release();
     } else Log("D3D9 probe failed %08x",hr);
@@ -957,7 +973,7 @@ extern "C" __declspec(dllexport) void InitializeASI() {
         GetModuleFileNameW(selfModule,logPath,MAX_PATH);   // so the dashboard can log too
         if(wchar_t* tail=wcsrchr(logPath,L'.')) wcscpy_s(tail,MAX_PATH-(tail-logPath),L".log");
         // Controls dashboard first: the game waits here, before it creates its window.
-        if(!wcsstr(exe,L"DualWindowsTest.exe")) ShowInputSetup();
+        if(!wcsstr(exe,L"DualWindowsTest.exe")) {StartWatchdog(); Stage("dashboard"); ShowInputSetup(); Stage("dashboard closed");}
         // Hooks must exist before the game makes its device: on a single screen its exclusive fullscreen
         // device otherwise makes the probe fail (D3DERR_DEVICELOST) and the mod never starts.
         // Waiting is capped in case this runs under the loader lock (the thread could not start yet).

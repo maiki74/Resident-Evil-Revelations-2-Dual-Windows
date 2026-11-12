@@ -23,6 +23,8 @@ Download the ready-to-use mod from **[Releases](../../releases/latest)** or from
 > **Known issue: the game may freeze when minimized.**
 > Minimizing the game during loading screens or certain gameplay sections may make it stop responding, and you then have to close and restart it. **This is not fixed yet.**
 > Avoid minimizing during loading screens and, when possible, during gameplay.
+>
+> **Help us fix it:** since v0.6.1 the mod saves where a frozen game got stuck. Wait about 15 seconds before closing the frozen game, then attach `scripts\ResidentEvilRevelations2.DualWindows.log` and `scripts\ResidentEvilRevelations2.DualWindows.hang1.dmp` to an [issue](../../issues).
 
 ## What it does
 
@@ -44,7 +46,7 @@ Revelations 2's local co-op squeezes both players into an uneven split screen. D
 
 1. Install FusionFix in the game folder, next to `rerev2.exe` (Steam: **Manage → Browse local files**).
 2. Start the game once and quit normally, so it creates its settings file.
-3. Download `RE2-DualWindows-v0.6.0.zip` from [Releases](../../releases/latest), extract it to its own folder and run **Install.cmd**.
+3. Download `RE2-DualWindows-v0.6.1.zip` from [Releases](../../releases/latest), extract it to its own folder and run **Install.cmd**.
 4. Start the game through Steam. The controls dashboard opens first: drag **Mouse + keyboard** onto one display and your **controller** onto the other, then press **Start game**.
 
 ## Hotkeys (with the game active)
@@ -97,6 +99,7 @@ The only third-party code is [MinHook](https://github.com/TsudaKageyu/minhook) (
 | `source/HudFix.h` | Fits the player HUD to each 16:9 window |
 | `source/SharedGui.h` | Draws shared menus and subtitles into both windows |
 | `source/MovieFrames.h` | Shows prerecorded cutscenes full-frame |
+| `source/Diagnostics.h` | Startup/monitor logging and the freeze watchdog (logs the stuck thread's stack and writes a small dump) |
 | `source/DualWindowsTest.cpp` | Offline test harness |
 
 The game itself only lets mouse + keyboard drive one character. The mod switches the game's input mode per player while that player's input, actions and button icons are processed. Mouse + keyboard is active only for the player on its display, and controllers are routed to the player shown on theirs. Comments in the source name the game functions involved, by address in the Steam executable.
@@ -105,7 +108,7 @@ The source contains no game code or game assets. You need your own copy of the g
 
 ## Contributing
 
-- **Bugs:** open an [issue](../../issues). Attach `scripts\ResidentEvilRevelations2.DualWindows.log` from the game folder and say which dashboard layout you used.
+- **Bugs:** open an [issue](../../issues). Attach `scripts\ResidentEvilRevelations2.DualWindows.log` (and any `.hang1.dmp` file) from the game folder and say which dashboard layout you used.
 - **Pull requests** are welcome. Please run `DualWindowsTest.exe` before submitting, and keep changes small and focused.
 
 ## Credits
