@@ -1,5 +1,14 @@
 # Resident Evil Revelations 2 – Dual Windows
 
+> [!CAUTION]
+> ## ⚠️ STILL IN DEVELOPMENT: EXPECT MANY BUGS ⚠️
+> **This mod is NOT finished.** It is an early, experimental build and **it can have MANY bugs**:
+> - **freezes** (especially on loading screens, after moving/resizing windows, or after minimizing);
+> - **crashes**;
+> - **input problems** (wrong controller on a player, mouse stops working, co-op not starting).
+>
+> Use it at your own risk. **Back up your saves** before playing. Please report every bug in [Issues](../../issues) with your log file.
+
 ## Full mouse + keyboard and controller support on separate screens
 
 **Two people can play Resident Evil Revelations 2 local co-op at the same time: one on mouse + keyboard, the other on a controller, each on their own window or screen.**
