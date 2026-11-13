@@ -48,8 +48,11 @@ static void __fastcall FitHud(uintptr_t object,int mode,uintptr_t context) {
         sharedGuiDrawn.store(true);
     }
     // uGUIHealNum (herb count) stays native while uGUIEquip is fitted, so it sat on the weapon/sub-item box.
-    // Raise only it, by 0.18 of the half-height (~97 px in a 1080p window), in co-op player windows.
-    if(nativeHeal&&constants&&table==executable+0xf9baf0) constants[3]+=0.18f;
+    // The game puts the item row at a different height per character in co-op (uGUIEquip exe+0x4e407c:
+    // character 0 at y=667, character 1 at y=559), so the herb count is stacked per character:
+    // character 0: above its row (+0.18 of the half-height, ~97 px at 1080p);
+    // character 1: below its higher row (-0.06, ~32 px), instead of in the middle of it.
+    if(nativeHeal&&constants&&table==executable+0xf9baf0) constants[3]+=*(int*)(object+0x2ac)==0?0.18f:-0.06f;
     if(adjust&&constants&&width>0&&height>0) {
         const float fit=std::min(1.0f,(float(width)/height)/(800.0f/360.0f));
         if(std::isfinite(fit)&&fit>0) {
@@ -59,6 +62,9 @@ static void __fastcall FitHud(uintptr_t object,int mode,uintptr_t context) {
             constants[3]=(constants[3]-1.0f)*fit+fit;
         }
     }
+    // Character 0's weapon wheel (uGUIEquipShortcut) ended ~70 px over that raised herb count (1080p: wheel
+    // bottom y=815, herb 742-800). Raise only that wheel by 0.20 (~108 px): ~35 px gap, top still below the map.
+    if(adjust&&constants&&table==executable+0xf9afb0&&*(int*)(object+0x2ac)==0) constants[3]+=0.20f;
     if(split==1&&(table==executable+0xf915b0||table==executable+0xf91970)) {   // action icons: which screen draws which widget
         static thread_local std::unordered_set<uint64_t> drawn;
         const unsigned camera=*(BYTE*)(viewport+0x158);

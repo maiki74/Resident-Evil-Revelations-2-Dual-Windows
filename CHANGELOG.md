@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.6.3: F3 panel now visible in the game, HUD spacing for Claire and Moira
+
+### Fixed
+- **The F3 mouse sensitivity panel now really appears in the game.** In v0.6.2 it was a separate small window: Windows reported it as shown and on top, but in the game it was not seen (for example on a filled player window or a streamed/captured screen). It is now drawn **inside the mouse + keyboard player's own picture**, so you see it wherever you see your game.
+- The panel works with the **mouse** again: drag or click the slider, or click **- 0.01**, **+ 0.01**, **Reset 1.00x** and **Close (F3)**. It draws its own pointer, and the cursor stays inside your picture while it is open.
+- Keyboard still works: **Left/Right or A/D** change it by 0.01 (hold to repeat), **R** resets, **Esc** or **F3** closes.
+- The game keeps the focus the whole time. When the panel closes, the mouse goes back to the camera at once.
+- **Moira's item row was crowded:** the herb (healing item) count had been raised into the middle of her row. In co-op the game puts each character's item row at a different height, so the herb count is now placed per character: above Claire's row, below Moira's row.
+- **Claire's weapon wheel covered the herb count** when opened. Claire's weapon wheel now opens higher, leaving a clear gap above the herb count. The closed HUD does not move.
+
+### Diagnostics and tests
+- The log shows F3 presses, which player window the panel is drawn into, its position inside the picture, and how many frames it was drawn.
+- New offline test: the panel is opened and both player windows' final images are read back from the graphics card. The panel must be in the mouse + keyboard window and not in the other one.
+
+### Tested
+- In-game by the author: F3 panel visible and adjustable, Moira's item row, Claire's weapon wheel and herb count.
+- The minimize freeze from older versions is still not confirmed fixed. If the game freezes, wait about 15 seconds, then send the log and the `.hang1.dmp` file.
+
 ## v0.6.2: co-op input fixes, F3 mouse sensitivity, freeze fixes
 
 ### Highlights
@@ -19,6 +37,7 @@
 - Note: a pause menu opened by the controller player answers only that player's controller.
 
 ### F3: mouse camera sensitivity
+- Note: in v0.6.2 this panel could stay invisible in the game. Fixed in v0.6.3.
 - **F3** opens a small panel on the mouse + keyboard player's screen.
 - **Left/Right arrows or A/D** change the sensitivity by **0.01** per press (hold to repeat). **R** resets to 1.00. **Esc** or **F3** closes it.
 - Range 0.10x to 3.00x. Applies at once. Saved as `MouseCameraSensitivity` in the `[Mouse]` section of `scripts\ResidentEvilRevelations2.DualWindows.ini`.

@@ -37,7 +37,11 @@ static UINT sourceWidth=960,sourceHeight=1080;
 struct ViewMap {RECT src,dst; bool valid;};
 static ViewMap viewMap[2];
 static SRWLOCK viewMapLock=SRWLOCK_INIT;
-static std::atomic<bool> sensitivityPanelOpen{false};   // F3 panel: the mouse + keyboard player's devices go to the panel
+static std::atomic<bool> sensitivityPanelOpen{false};
+static RECT lastGameClip{},panelClip{}; static bool haveGameClip=false,panelClipped=false;   // game's ClipCursor rect / F3 panel's
+static void ReleaseSensitivityPanel(); static int SensitivityPanelWindow();
+static bool DrawSensitivityPanel(IDirect3DDevice9* d,IDirect3DSurface9* dest,const RECT& picture,int window,bool active);
+static RECT PanelRect(const RECT& picture,float s); static float PanelScale(const RECT& picture);   // F3 panel: the mouse + keyboard player's devices go to the panel
 static BYTE* fusionModule=nullptr;
 static wchar_t logPath[MAX_PATH];
 using PresentFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*,const RECT*,HWND,const RGNDATA*);
@@ -197,6 +201,7 @@ static void ReleaseChains() {
     movieDrawn.store(false);
     lastFrameWasMovie.store(false);
     ReleaseSharedGui();
+    ReleaseSensitivityPanel();
     for(int i=0;i<2;++i) { ReleaseNow(chains[i],i?"Player 2 swap chain":"Player 1 swap chain"); chainW[i]=chainH[i]=0; }
     ReleaseSRWLockExclusive(&drawLock);
 }
@@ -356,7 +361,7 @@ static DWORD WINAPI WindowLoop(void*) {
         RECT r={0,0,width,width*9/16}; AdjustWindowRectEx(&r,WS_OVERLAPPEDWINDOW,FALSE,WS_EX_NOACTIVATE);
         int x=area.left+12+(monitors.size()>1?0:i*available/2);
         views[i]=CreateWindowExW(WS_EX_NOACTIVATE,L"Rev2DualWindowsV2",
-            i?L"RE Revelations 2 — Display 2 (v0.6.2)":L"RE Revelations 2 — Display 1 (v0.6.2)",   // same names as the dashboard
+            i?L"RE Revelations 2 — Display 2 (v0.6.3)":L"RE Revelations 2 — Display 1 (v0.6.3)",   // same names as the dashboard
             WS_OVERLAPPEDWINDOW,x,area.top+30,r.right-r.left,r.bottom-r.top,gameWindow,nullptr,selfModule,nullptr);
         if(!views[i])return 2;
         if(HMENU menu=GetSystemMenu(views[i],FALSE)) {
@@ -502,7 +507,7 @@ static void DrawViews(IDirect3DDevice9* d) {
         else Log("F1 ignored: co-op is not on yet (one character)");
     }
     if(active&&(GetAsyncKeyState(VK_F2)&1)) ForceCoop();
-    if(active&&!testMode&&(GetAsyncKeyState(VK_F3)&1)) ToggleSensitivityPanel();
+    if(active&&!testMode&&(GetAsyncKeyState(VK_F3)&1)) {LogF("F3 pressed: sensitivity panel %s",sensitivityPanelOpen.load()?"closing":"opening"); ToggleSensitivityPanel();}
     const int swap=MainView();
     const bool capture=active&&(GetAsyncKeyState(VK_F5)&1);
     int mode=GameMode();
@@ -569,6 +574,27 @@ static void DrawViews(IDirect3DDevice9* d) {
         HRESULT hr=d->StretchRect(frameSource,&src,dest,&dst,D3DTEXF_LINEAR);
         if(SUCCEEDED(hr)) {AcquireSRWLockExclusive(&viewMapLock); viewMap[i]={src,dst,true}; ReleaseSRWLockExclusive(&viewMapLock);}
         if(SUCCEEDED(hr)&&composite) DrawSharedGui(d,dest,dst);
+        if(SUCCEEDED(hr)&&sensitivityPanelOpen.load()&&i==SensitivityPanelWindow()) DrawSensitivityPanel(d,dest,dst,i,active);
+        if(testMode&&SUCCEEDED(hr)&&!movie&&(pixelChecks&3)==3&&!(pixelChecks&0x10)) {
+            // F3 panel: open it, read back BOTH player windows' swap chains: panel body colour must be in the
+            // mouse + keyboard window's picture and must not be in the other one.
+            static bool opened=false; static UINT seen=0;
+            if(!opened) {opened=true; ToggleSensitivityPanel(); if(i==SensitivityPanelWindow()) DrawSensitivityPanel(d,dest,dst,i,active);}
+            const float ps=PanelScale(dst); const RECT pr=PanelRect(dst,ps);
+            IDirect3DSurface9* readback=nullptr; DWORD px=0;
+            if(SUCCEEDED(d->CreateOffscreenPlainSurface(chainW[i],chainH[i],desc.Format,D3DPOOL_SYSTEMMEM,&readback,nullptr))) {
+                D3DLOCKED_RECT lock;
+                if(SUCCEEDED(d->GetRenderTargetData(dest,readback))&&SUCCEEDED(readback->LockRect(&lock,nullptr,D3DLOCK_READONLY))) {
+                    px=*(DWORD*)((BYTE*)lock.pBits+(pr.top+(LONG)(92*ps))*lock.Pitch+(pr.left+(LONG)(8*ps))*4)&0xffffff; readback->UnlockRect();
+                }
+                readback->Release();
+            }
+            const bool panelHere=px==0x1c2026,want=i==SensitivityPanelWindow();
+            if(panelHere&&want) SaveSurface(d,dest,L"panel-test-player-window.bmp");   // the exact image that window presents
+            seen|=(panelHere==want?1u:0u)<<i;
+            if(panelHere!=want) LogF("Panel pixel test: window %d pixel %06lx (panel expected %u)",i,px,want);
+            if(seen==3) {pixelChecks|=0x10; ToggleSensitivityPanel(); Log("Panel pixel test: drawn in the mouse + keyboard window only");}
+        }
         const UINT checkBit=1u<<(i+(movie?2:0));
         if(testMode&&frames>20&&!(pixelChecks&checkBit)&&SUCCEEDED(hr)) {
             IDirect3DSurface9* readback=nullptr;
@@ -1182,7 +1208,10 @@ static BOOL WINAPI CursorPosition(HWND h,LPPOINT p) {   // exe+0x8278be
     p->x=GameClientFor(pixel.x,vp.left,vp.right,sourceWidth); p->y=GameClientFor(pixel.y,vp.top,vp.bottom,sourceHeight);
     return ok;
 }
-static BOOL WINAPI GameClipCursor(const RECT* r) {return ClipCursor(r);}   // exe+0x82768b
+static BOOL WINAPI GameClipCursor(const RECT* r) {   // F3 panel open: cursor stays in the mouse + keyboard player's picture
+    haveGameClip=r!=nullptr; if(r) lastGameClip=*r;
+    return ClipCursor(sensitivityPanelOpen.load()&&panelClipped?&panelClip:r);
+}   // exe+0x82768b
 static void CursorFollowsPlayerWindows() {
     const struct {DWORD rva; DWORD iat; void* to; const char* name;} sites[]={
         {0x82745d,0xe3f348,(void*)CursorOverPicture,"cursor over picture"},{0x8278be,0xe3f348,(void*)CursorPosition,"cursor position"},
@@ -1244,13 +1273,26 @@ static void PerPlayerActionGates() {
     else if(MH_CreateHook(heal,HookHealRequest,(void**)&realHealRequest)!=MH_OK||MH_EnableHook(heal)!=MH_OK) Log("Quick heal log: hook failed");
 }
 // ---- F3: mouse camera sensitivity panel ----
-// Keyboard only: Left/Right or A/D change it by 0.01 (hold to repeat), R resets, Esc or F3 closes.
-// The panel never takes focus or mouse clicks (keys are read with GetAsyncKeyState), so the game keeps its
-// window and mouse capture. While it is open the game gets no mouse or keyboard input from the mouse +
-// keyboard player (HookDeviceState); the controller player keeps playing.
-// Saved as [Mouse] MouseCameraSensitivity in scripts\ResidentEvilRevelations2.DualWindows.ini.
-static std::atomic<HWND> sensitivityPanel{nullptr};
-enum {PanelBar=1,PanelText,PanelToggle=WM_APP+5,PanelTimer=7};
+// Drawn INTO the mouse + keyboard player's picture: into that window's own swap chain, right before it is
+// presented, so it is seen wherever that picture is seen (monitor, filled window, capture or streaming).
+// Why: the earlier panel was a separate desktop window. The log of 2026-11-13 shows it shown, painted, foreground
+// and not covered (2694,454, centre of the filled Display 1 window on \\.\DISPLAY21), yet it was not seen in-game.
+// No extra window and no focus change: the game stays the foreground window.
+// Mouse: while open the cursor is clipped to that window's picture and the panel draws its own pointer (the game
+// hides the system cursor over its picture). Drag or click the slider, click -0.01 / +0.01 / Reset / Close.
+// Keyboard: Left/Right or A/D 0.01 (hold to repeat), R reset, Esc or F3 close. While open the game gets no mouse
+// or keyboard input (HookDeviceState) and the camera holds still (scale 0 in the input builder). On close the
+// game's own cursor clip is put back. Saved as [Mouse] MouseCameraSensitivity in scripts\...DualWindows.ini.
+static const int PanelW=440,PanelH=176;
+struct PanelHit {RECT track,less,more,reset,close;};
+static struct {
+    IDirect3DSurface9* surface=nullptr; D3DFORMAT format=D3DFMT_UNKNOWN; int w=0,h=0;   // D3DPOOL_DEFAULT, lockable
+    HDC dc=nullptr; HBITMAP bitmap=nullptr; HGDIOBJ oldBitmap=nullptr; DWORD* bits=nullptr; int bw=0,bh=0;
+    HFONT font=nullptr,big=nullptr; float fontScale=0;
+    float shownValue=-1; int shownHover=-2,shownDown=-2; bool dirty=true;
+    bool dragging=false,wasDown=false; DWORD heldSince=0,lastStep=0;
+    unsigned framesDrawn=0,framesMissed=0; bool loggedPlacement=false;
+} panel;
 static void SaveSensitivity() {
     wchar_t ini[MAX_PATH],v[16]; setup::IniPath(ini); swprintf_s(v,L"%.2f",mouseSensitivity.load());
     WritePrivateProfileStringW(L"Mouse",L"MouseCameraSensitivity",v,ini);
@@ -1260,75 +1302,171 @@ static void LoadSensitivity() {
     mouseSensitivity=ClampSensitivity((float)_wtof(v)); LogF("Mouse camera sensitivity: %.2fx (F3 to change)",mouseSensitivity.load());
 }
 static float StepSensitivity(float s,int steps) {return ClampSensitivity(std::round(s*100.0f+steps)/100.0f);}   // exact 0.01 grid, no float drift
-static void ShowSensitivity(HWND h,float s) {
-    s=ClampSensitivity(s); mouseSensitivity=s;
-    SetScrollPos(GetDlgItem(h,PanelBar),SB_CTL,(int)(s*100+0.5f),TRUE);
-    wchar_t t[64]; swprintf_s(t,L"Mouse camera sensitivity: %.2fx",s); SetDlgItemTextW(h,PanelText,t);
+static int SensitivityPanelWindow() {   // the window showing the mouse + keyboard player (follows F1 in co-op)
+    if(KeyboardOwnsCoop()) return (swapPlayers.load()?1:0)^MainView();
+    return deviceDisplay[DevKeyboard]==2?1:0;
 }
-static void ClosePanel(HWND h) {
-    if(!IsWindowVisible(h)) return;
-    KillTimer(h,PanelTimer); ShowWindow(h,SW_HIDE); sensitivityPanelOpen=false; SaveSensitivity();
-    LogF("Sensitivity panel closed: %.2fx saved",mouseSensitivity.load());
+// Panel layout in panel pixels (scaled down only when the window is too small for 440x176).
+static PanelHit PanelLayout(float s) {
+    auto R=[s](int l,int t,int r,int b){return RECT{(LONG)(l*s),(LONG)(t*s),(LONG)(r*s),(LONG)(b*s)};};
+    return {R(24,64,416,84),R(16,100,100,132),R(108,100,192,132),R(200,100,316,132),R(324,100,424,132)};
 }
-static void OpenPanel(HWND h) {
-    const int display=deviceDisplay[DevKeyboard]?deviceDisplay[DevKeyboard]-1:0;
-    RECT area; HWND over=views[display]&&IsWindowVisible(views[display])?views[display]:gameWindow;
-    if(!over||!GetWindowRect(over,&area)) {MONITORINFO mi={sizeof(mi)}; GetMonitorInfoW(MonitorFromPoint({0,0},MONITOR_DEFAULTTOPRIMARY),&mi); area=mi.rcWork;}
-    RECT r; GetWindowRect(h,&r); const int w=r.right-r.left,ht=r.bottom-r.top;
-    SetWindowPos(h,HWND_TOPMOST,(area.left+area.right-w)/2,(area.top+area.bottom-ht)/2,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
-    for(int k:{VK_LEFT,VK_RIGHT,(int)'A',(int)'D',(int)'R',VK_ESCAPE}) GetAsyncKeyState(k);   // drop presses made before opening
-    ShowSensitivity(h,mouseSensitivity.load()); sensitivityPanelOpen=true; SetTimer(h,PanelTimer,15,nullptr);
-    LogF("Sensitivity panel opened on Display %d: %.2fx",display+1,mouseSensitivity.load());
+static float PanelScale(const RECT& picture) {
+    const float s=std::min({1.0f,(picture.right-picture.left-16)/(float)PanelW,(picture.bottom-picture.top-16)/(float)PanelH});
+    return std::max(0.3f,s);
 }
-static void PanelKeys(HWND h) {
-    static DWORD heldSince=0,lastStep=0;
-    const auto down=[](int k){return (GetAsyncKeyState(k)&0x8000)!=0;};
-    if(GetAsyncKeyState(VK_ESCAPE)&1) {ClosePanel(h); return;}
-    if(GetAsyncKeyState('R')&1) {ShowSensitivity(h,1.0f); SaveSensitivity(); return;}
-    const int dir=(down(VK_RIGHT)||down('D'))-(down(VK_LEFT)||down('A'));
-    const DWORD now=GetTickCount();
-    if(!dir) {heldSince=0; return;}
-    if(!heldSince) heldSince=now;                                  // first press: one step
-    else if(now-heldSince<400||now-lastStep<40) return;            // held: repeat after 0.4 s, 25 steps/s
-    lastStep=now; ShowSensitivity(h,StepSensitivity(mouseSensitivity.load(),dir)); SaveSensitivity();
+static RECT PanelRect(const RECT& picture,float s) {   // centred in the picture, in client pixels
+    const int w=(int)(PanelW*s),h=(int)(PanelH*s),x=(picture.left+picture.right-w)/2,y=(picture.top+picture.bottom-h)/2;
+    return {x,y,x+w,y+h};
 }
-static LRESULT CALLBACK PanelProc(HWND h,UINT msg,WPARAM w,LPARAM l) {
-    switch(msg) {
-    case PanelToggle: if(IsWindowVisible(h)) ClosePanel(h); else OpenPanel(h); return 0;
-    case WM_TIMER: if(w==PanelTimer) PanelKeys(h); return 0;
-    case WM_MOUSEACTIVATE: return MA_NOACTIVATEANDEAT;
-    case WM_NCHITTEST: return HTTRANSPARENT;                       // mouse goes past it, not into it
-    case WM_CLOSE: ClosePanel(h); return 0;
+static float TrackValue(const RECT& track,LONG x) {
+    const float t=std::clamp((x-track.left)/(float)std::max(1L,track.right-track.left),0.0f,1.0f);
+    return ClampSensitivity(std::round((0.1f+t*2.9f)*100.0f)/100.0f);
+}
+static void ReleaseSensitivityPanel() {   // device reset / shutdown: D3DPOOL_DEFAULT surface must go
+    if(panel.surface) {panel.surface->Release(); panel.surface=nullptr;}
+}
+static void PaintPanel(float s,int hover,int down) {   // GDI into a 32-bit DIB, then copied into the D3D surface
+    const int w=(int)(PanelW*s),h=(int)(PanelH*s);
+    if(!panel.dc||panel.bw!=w||panel.bh!=h) {
+        if(panel.dc) {SelectObject(panel.dc,panel.oldBitmap); DeleteObject(panel.bitmap); DeleteDC(panel.dc); panel.dc=nullptr;}
+        BITMAPINFO bi={}; bi.bmiHeader={sizeof(BITMAPINFOHEADER),w,-h,1,32,BI_RGB};
+        panel.dc=CreateCompatibleDC(nullptr); panel.bitmap=CreateDIBSection(panel.dc,&bi,DIB_RGB_COLORS,(void**)&panel.bits,nullptr,0);
+        if(!panel.dc||!panel.bitmap) {Log("Sensitivity panel: GDI bitmap not created"); return;}
+        panel.oldBitmap=SelectObject(panel.dc,panel.bitmap); panel.bw=w; panel.bh=h;
     }
-    return DefWindowProcW(h,msg,w,l);
-}
-static DWORD WINAPI PanelLoop(void*) {
-    WNDCLASSW wc={}; wc.lpfnWndProc=PanelProc; wc.hInstance=selfModule; wc.lpszClassName=L"Rev2DualWindowsSensitivity";
-    wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassW(&wc);
-    const DWORD ex=WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE;
-    RECT r={0,0,356,84}; AdjustWindowRectEx(&r,WS_POPUP|WS_CAPTION,FALSE,ex);
-    HWND h=CreateWindowExW(ex,wc.lpszClassName,L"Dual Windows: mouse camera (F3)",WS_POPUP|WS_CAPTION,
-                           0,0,r.right-r.left,r.bottom-r.top,nullptr,nullptr,selfModule,nullptr);
-    if(!h) {Log("Sensitivity panel: window not created"); return 1;}
-    const HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    const struct {const wchar_t* cls; const wchar_t* text; DWORD style; int x,y,w,ht,id;} items[]={
-        {L"STATIC",L"",SS_LEFT,12,10,332,18,PanelText},
-        {L"SCROLLBAR",L"",SBS_HORZ|WS_DISABLED,12,32,332,18,PanelBar},
-        {L"STATIC",L"Left/Right or A/D: 0.01 (hold to repeat). R: reset. Esc or F3: close.",SS_LEFT,12,58,332,18,0}};
-    for(auto& it:items) {
-        HWND c=CreateWindowExW(0,it.cls,it.text,WS_CHILD|WS_VISIBLE|it.style,it.x,it.y,it.w,it.ht,h,(HMENU)(INT_PTR)it.id,selfModule,nullptr);
-        if(c) SendMessageW(c,WM_SETFONT,(WPARAM)font,TRUE);
+    if(panel.fontScale!=s) {
+        if(panel.font) DeleteObject(panel.font); if(panel.big) DeleteObject(panel.big);
+        panel.font=CreateFontW(-(int)(15*s),0,0,0,FW_NORMAL,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        panel.big=CreateFontW(-(int)(21*s),0,0,0,FW_BOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+        panel.fontScale=s;
     }
-    SetScrollRange(GetDlgItem(h,PanelBar),SB_CTL,10,300,FALSE);
-    sensitivityPanel=h; OpenPanel(h);
-    MSG msg;
-    while(GetMessageW(&msg,nullptr,0,0)>0) {TranslateMessage(&msg); DispatchMessageW(&msg);}
-    return 0;
+    HDC dc=panel.dc; const PanelHit hit=PanelLayout(s); const float v=mouseSensitivity.load();
+    auto fill=[dc](RECT r,COLORREF c){HBRUSH b=CreateSolidBrush(c); FillRect(dc,&r,b); DeleteObject(b);};
+    auto text=[dc](RECT r,const wchar_t* t,COLORREF c,UINT f){SetTextColor(dc,c); DrawTextW(dc,t,-1,&r,f|DT_NOPREFIX);};
+    SetBkMode(dc,TRANSPARENT);
+    fill({0,0,w,h},RGB(235,235,235)); fill({(LONG)(2*s),(LONG)(2*s),w-(LONG)(2*s),h-(LONG)(2*s)},RGB(28,32,38));   // light border, dark body
+    wchar_t t[96];
+    SelectObject(dc,panel.big); swprintf_s(t,L"Mouse camera sensitivity: %.2fx",v);
+    text({(LONG)(16*s),(LONG)(12*s),w-(LONG)(16*s),(LONG)(40*s)},t,RGB(255,255,255),DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    SelectObject(dc,panel.font);
+    text({(LONG)(16*s),(LONG)(40*s),w-(LONG)(16*s),(LONG)(60*s)},L"0.10x",RGB(160,170,180),DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    text({(LONG)(16*s),(LONG)(40*s),w-(LONG)(16*s),(LONG)(60*s)},L"3.00x",RGB(160,170,180),DT_RIGHT|DT_SINGLELINE|DT_VCENTER);
+    RECT tr=hit.track; fill({tr.left,tr.top+(tr.bottom-tr.top)/2-(LONG)(3*s),tr.right,tr.top+(tr.bottom-tr.top)/2+(LONG)(3*s)},RGB(90,100,112));
+    const LONG kx=tr.left+(LONG)((v-0.1f)/2.9f*(tr.right-tr.left));
+    fill({tr.left,tr.top+(tr.bottom-tr.top)/2-(LONG)(3*s),kx,tr.top+(tr.bottom-tr.top)/2+(LONG)(3*s)},RGB(70,150,230));   // filled part
+    const LONG one=tr.left+(LONG)((1.0f-0.1f)/2.9f*(tr.right-tr.left)); fill({one-1,tr.top+(LONG)(2*s),one+1,tr.bottom-(LONG)(2*s)},RGB(160,170,180));   // 1.00x mark
+    fill({kx-(LONG)(7*s),tr.top-(LONG)(4*s),kx+(LONG)(7*s),tr.bottom+(LONG)(4*s)},hover==0||down==0?RGB(255,255,255):RGB(210,220,232));   // thumb
+    const RECT buttons[]={hit.less,hit.more,hit.reset,hit.close}; const wchar_t* labels[]={L"- 0.01",L"+ 0.01",L"Reset 1.00x",L"Close (F3)"};
+    for(int b=0;b<4;++b) {
+        const COLORREF face=down==b+1?RGB(40,110,190):hover==b+1?RGB(78,90,104):RGB(56,64,74);
+        fill(buttons[b],RGB(150,160,172)); fill({buttons[b].left+1,buttons[b].top+1,buttons[b].right-1,buttons[b].bottom-1},face);
+        text(buttons[b],labels[b],RGB(255,255,255),DT_CENTER|DT_SINGLELINE|DT_VCENTER);
+    }
+    text({(LONG)(16*s),(LONG)(140*s),w-(LONG)(16*s),(LONG)(166*s)},L"Drag/click.  Left/Right or A/D: 0.01.  R: reset.  Esc/F3: close.",RGB(170,180,190),DT_LEFT|DT_SINGLELINE|DT_VCENTER);
+    GdiFlush();
+    for(int i=0;i<w*h;++i) panel.bits[i]|=0xff000000;   // opaque for A8R8G8B8 back buffers
+}
+static bool UploadPanel(IDirect3DDevice9* d,D3DFORMAT format) {
+    if(panel.surface&&(panel.format!=format||panel.w!=panel.bw||panel.h!=panel.bh)) ReleaseSensitivityPanel();
+    if(!panel.surface) {
+        const HRESULT hr=d->CreateOffscreenPlainSurface(panel.bw,panel.bh,format,D3DPOOL_DEFAULT,&panel.surface,nullptr);
+        if(FAILED(hr)) {LogF("Sensitivity panel: surface %dx%d format %d not created (%08lx)",panel.bw,panel.bh,(int)format,hr); panel.surface=nullptr; return false;}
+        panel.format=format; panel.w=panel.bw; panel.h=panel.bh;
+    }
+    D3DLOCKED_RECT lock; const HRESULT hr=panel.surface->LockRect(&lock,nullptr,0);
+    if(FAILED(hr)) {LogF("Sensitivity panel: surface lock failed (%08lx)",hr); return false;}
+    for(int y=0;y<panel.h;++y) memcpy((BYTE*)lock.pBits+y*lock.Pitch,panel.bits+y*panel.w,panel.w*4);
+    panel.surface->UnlockRect(); return true;
+}
+static void DrawPointer(IDirect3DDevice9* d,IDirect3DSurface9* dest,const RECT& bounds,POINT p) {   // arrow, black outline
+    for(int row=0;row<18;++row) {
+        const int width=row<13?row+1:std::max(1,13-(row-13)*3);
+        RECT outline={p.x-1,p.y+row-1,p.x+width+1,p.y+row+1},inner={p.x,p.y+row,p.x+width-(row<13?1:0),p.y+row+1};
+        RECT o,i; if(IntersectRect(&o,&outline,&bounds)) d->ColorFill(dest,&o,D3DCOLOR_XRGB(0,0,0));
+        if(inner.right>inner.left&&IntersectRect(&i,&inner,&bounds)) d->ColorFill(dest,&i,D3DCOLOR_XRGB(255,255,255));
+    }
+}
+static void ClosePanel(const char* how) {
+    if(!sensitivityPanelOpen.exchange(false)) return;
+    panel.dragging=false; SaveSensitivity();
+    if(panelClipped) {panelClipped=false; ClipCursor(haveGameClip?&lastGameClip:nullptr);}   // the game's own capture again
+    LogF("Sensitivity panel closed (%s): %.2fx saved; drawn in %u frames, %u frames could not be drawn",how,mouseSensitivity.load(),panel.framesDrawn,panel.framesMissed);
 }
 static void ToggleSensitivityPanel() {
-    if(HWND h=sensitivityPanel.load()) {PostMessageW(h,PanelToggle,0,0); return;}
-    static LONG starting=0; if(InterlockedExchange(&starting,1)) return;
-    if(HANDLE t=CreateThread(nullptr,0,PanelLoop,nullptr,0,nullptr)) CloseHandle(t);
+    if(sensitivityPanelOpen.load()) {ClosePanel("F3"); return;}
+    for(int k:{VK_LEFT,VK_RIGHT,(int)'A',(int)'D',(int)'R',VK_ESCAPE,VK_LBUTTON}) GetAsyncKeyState(k);   // drop presses made before opening
+    panel.dirty=true; panel.dragging=false; panel.wasDown=(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0; panel.heldSince=0;
+    panel.framesDrawn=panel.framesMissed=0; panel.loggedPlacement=false;
+    sensitivityPanelOpen=true;
+    const int w=SensitivityPanelWindow();
+    LogF("Sensitivity panel opened: %.2fx, drawn into player window %d (Display %d)%s",mouseSensitivity.load(),w,w+1,
+         views[w]&&IsWindowVisible(views[w])&&!IsIconic(views[w])?"":" - that window is hidden or minimized");
+}
+// Render thread, once per frame per player window, after the game picture is in `dest`. Returns true if drawn.
+static bool DrawSensitivityPanel(IDirect3DDevice9* d,IDirect3DSurface9* dest,const RECT& picture,int window,bool active) {
+    const float s=PanelScale(picture); const RECT where=PanelRect(picture,s); const PanelHit hit0=PanelLayout(s);
+    auto at=[&](RECT r){OffsetRect(&r,where.left,where.top); return r;};
+    // --- mouse (client pixels of this window; the swap chain area is the client area 1:1) ---
+    POINT screen{},client{}; bool haveMouse=false;
+    if(!testMode&&views[window]&&GetCursorPos(&screen)) {client=screen; haveMouse=ScreenToClient(views[window],&client)!=0;}
+    if(haveMouse&&active) {   // hold the cursor inside this player's picture while the panel is open
+        RECT c=picture; POINT tl{c.left,c.top},br{c.right,c.bottom}; ClientToScreen(views[window],&tl); ClientToScreen(views[window],&br);
+        panelClip={tl.x,tl.y,br.x,br.y}; panelClipped=true; ClipCursor(&panelClip);
+    }
+    int hover=-1; const bool down=active&&(GetAsyncKeyState(VK_LBUTTON)&0x8000)!=0;
+    const RECT track=at(hit0.track);
+    if(haveMouse) {
+        RECT trackArea={track.left-(LONG)(8*s),track.top-(LONG)(8*s),track.right+(LONG)(8*s),track.bottom+(LONG)(8*s)};
+        if(PtInRect(&trackArea,client)) hover=0;
+        const RECT b[]={at(hit0.less),at(hit0.more),at(hit0.reset),at(hit0.close)};
+        for(int k=0;k<4;++k) if(PtInRect(&b[k],client)) hover=k+1;
+    }
+    if(down&&!panel.wasDown) {   // press
+        if(hover==0) panel.dragging=true;
+        else if(hover>=1) {
+            const float v=mouseSensitivity.load();
+            if(hover==1) mouseSensitivity=StepSensitivity(v,-1); else if(hover==2) mouseSensitivity=StepSensitivity(v,1);
+            else if(hover==3) mouseSensitivity=1.0f;
+            if(hover==4) {panel.wasDown=down; ClosePanel("Close button"); return false;}
+            SaveSensitivity(); LogF("Sensitivity panel: button %d clicked -> %.2fx",hover,mouseSensitivity.load());
+        }
+    }
+    if(panel.dragging&&haveMouse) {const float v=TrackValue(track,client.x); if(v!=mouseSensitivity.load()) mouseSensitivity=v;}
+    if(!down&&panel.dragging) {panel.dragging=false; SaveSensitivity(); LogF("Sensitivity panel: slider set to %.2fx",mouseSensitivity.load());}
+    panel.wasDown=down;
+    // --- keyboard ---
+    if(active&&!testMode) {
+        if(GetAsyncKeyState(VK_ESCAPE)&1) {ClosePanel("Esc"); return false;}
+        if(GetAsyncKeyState('R')&1) {mouseSensitivity=1.0f; SaveSensitivity();}
+        auto held=[](int k){return (GetAsyncKeyState(k)&0x8000)!=0;};
+        const int dir=(held(VK_RIGHT)||held('D'))-(held(VK_LEFT)||held('A')); const DWORD now=GetTickCount();
+        if(!dir) panel.heldSince=0;
+        else if(!panel.heldSince||(now-panel.heldSince>=400&&now-panel.lastStep>=40)) {
+            if(!panel.heldSince) panel.heldSince=now;
+            panel.lastStep=now; mouseSensitivity=StepSensitivity(mouseSensitivity.load(),dir); SaveSensitivity();
+        }
+    }
+    // --- draw ---
+    const float v=mouseSensitivity.load(); const int pressed=down?hover:-1;
+    if(panel.dirty||v!=panel.shownValue||hover!=panel.shownHover||pressed!=panel.shownDown||panel.bw!=where.right-where.left||panel.bh!=where.bottom-where.top) {
+        PaintPanel(s,hover,pressed); panel.shownValue=v; panel.shownHover=hover; panel.shownDown=pressed; panel.dirty=true;
+    }
+    D3DSURFACE_DESC dd; dest->GetDesc(&dd);
+    if(!panel.bits||((panel.dirty||!panel.surface||panel.format!=dd.Format)&&!UploadPanel(d,dd.Format))) {++panel.framesMissed; return false;}
+    panel.dirty=false;
+    RECT to=where; const HRESULT hr=d->StretchRect(panel.surface,nullptr,dest,&to,D3DTEXF_NONE);
+    if(FAILED(hr)) {if(panel.framesMissed++<3) LogF("Sensitivity panel: copy into player window %d failed (%08lx)",window,hr); return false;}
+    if(haveMouse) DrawPointer(d,dest,picture,client);
+    if(!panel.loggedPlacement) {
+        panel.loggedPlacement=true; RECT wr{}; if(views[window]) GetWindowRect(views[window],&wr);
+        LogF("Sensitivity panel drawn into player window %d (Display %d, screen %ld,%ld %ldx%ld): panel %ld,%ld %ldx%ld inside picture %ld,%ld %ldx%ld (fully inside %u), format %d, mouse %s at %ld,%ld",
+             window,window+1,wr.left,wr.top,wr.right-wr.left,wr.bottom-wr.top,where.left,where.top,where.right-where.left,where.bottom-where.top,
+             picture.left,picture.top,picture.right-picture.left,picture.bottom-picture.top,
+             where.left>=picture.left&&where.top>=picture.top&&where.right<=picture.right&&where.bottom<=picture.bottom,(int)dd.Format,
+             haveMouse?"held in the picture":"not read",client.x,client.y);
+    }
+    ++panel.framesDrawn; return true;
 }
 static void KeyboardForMainOnly() {
     if(!deviceDisplay[DevKeyboard]) {Log("Mouse + keyboard not assigned: co-op input unchanged");return;}
@@ -1555,7 +1693,7 @@ static DWORD WINAPI Initialize(void*) {
     wchar_t* tail=wcsrchr(logPath,L'.'); if(tail) wcscpy_s(tail,MAX_PATH-(tail-logPath),L".log");
     wchar_t exe[MAX_PATH];GetModuleFileNameW(nullptr,exe,MAX_PATH);
     testMode=wcsstr(exe,L"DualWindowsTest.exe")!=nullptr;
-    Log("DualWindows prototype 0.6.2 initializing");
+    Log("DualWindows prototype 0.6.3 initializing");
     WNDCLASSW wc={};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=selfModule;wc.lpszClassName=L"Rev2DualProbe";
     RegisterClassW(&wc);
     HWND probe=CreateWindowW(wc.lpszClassName,L"",WS_OVERLAPPED,0,0,32,32,nullptr,nullptr,selfModule,nullptr);

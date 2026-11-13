@@ -43,7 +43,7 @@ int main() {
         if(frame==35||frame==185) createsBefore=creates();
         if(frame==175||frame==285) recreatedWhileResizing+=creates()-createsBefore;
         if(frame==40) {
-            output=FindWindowW(L"Rev2DualWindowsV2",L"RE Revelations 2 \u2014 Display 1 (v0.6.2)");
+            output=FindWindowW(L"Rev2DualWindowsV2",L"RE Revelations 2 \u2014 Display 1 (v0.6.3)");
             if(output) PostMessageW(output,WM_SYSCOMMAND,0x1120,0);
         }
         if(frame==60&&output) {
@@ -98,11 +98,11 @@ int main() {
         }
         HRESULT hr=d->Present(0,0,0,0);if(frame%120==0)printf("frame=%d present=%08x hooks=%u success=%u iconic=%d\n",frame,hr,calls(),stats(),IsIconic(hwnd));Sleep(16);
     }
-    UINT result=stats();bool passed=inputOK&&result>360&&resetOK&&rejectedBadAspect&&pixels()==15&&presetOK&&fillOK&&restoreOK&&concurrentOK&&creates&&recreatedWhileResizing==0;
+    UINT result=stats();bool passed=inputOK&&result>360&&resetOK&&rejectedBadAspect&&pixels()==0x1f&&presetOK&&fillOK&&restoreOK&&concurrentOK&&creates&&recreatedWhileResizing==0;
     printf("Swap chains recreated while resizing: %u (expected 0)\n",recreatedWhileResizing);
     printf("Concurrent presents while resizing: %s (%ld from the second thread)\n",concurrentOK?"OK":"FAIL",painterPresents);
     printf("Resolution preset=%s, monitor fill=%s, restore=%s\n",presetOK?"OK":"FAIL",fillOK?"OK":"FAIL",restoreOK?"OK":"FAIL");
-    printf("%s: %u player frames, Reset=%s, invalid-aspect rejection=%s, gameplay + movie pixel checks=%x (expected f)\n",passed?"PASS":"FAIL",result,resetOK?"OK":"FAIL",rejectedBadAspect?"OK":"FAIL",pixels());
+    printf("%s: %u player frames, Reset=%s, invalid-aspect rejection=%s, gameplay + movie pixel checks=%x (expected 1f)\n",passed?"PASS":"FAIL",result,resetOK?"OK":"FAIL",rejectedBadAspect?"OK":"FAIL",pixels());
     // All extra surfaces belong to this process and are released by process teardown.
     return passed?0:5;
 }
