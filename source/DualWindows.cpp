@@ -33,11 +33,28 @@ static uintptr_t modeRoot=0;
 static UINT frames=0, successes=0, lastWidth=0, lastHeight=0;
 static UINT pixelChecks=0;
 static UINT sourceWidth=960,sourceHeight=1080;
+// What each player window shows: back-buffer rectangle src drawn into client rectangle dst (menu cursor mapping).
+struct ViewMap {RECT src,dst; bool valid;};
+static ViewMap viewMap[2];
+static SRWLOCK viewMapLock=SRWLOCK_INIT;
+static std::atomic<bool> sensitivityPanelOpen{false};   // F3 panel: the mouse + keyboard player's devices go to the panel
 static BYTE* fusionModule=nullptr;
 static wchar_t logPath[MAX_PATH];
 using PresentFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*,const RECT*,const RECT*,HWND,const RGNDATA*);
 using ResetFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*,D3DPRESENT_PARAMETERS*);
 static PresentFn realPresent;
+// Player windows are presented with d3d9's own swap-chain Present, hooked here at startup before any overlay
+// (Steam, Discord) hooks it. All three freeze dumps (2026-11-12) had the render thread inside overlay code that
+// had hooked a player-window Present, waiting for the Direct3D lock held by a game loading thread stuck in the
+// NVIDIA driver (CreateTexture). The overlays still draw on the game itself; they just never touch these windows.
+using ChainPresentFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3DSwapChain9*,const RECT*,const RECT*,HWND,const RGNDATA*,DWORD);
+static ChainPresentFn rawChainPresent;
+static HRESULT STDMETHODCALLTYPE HookChainPresent(IDirect3DSwapChain9* s,const RECT* a,const RECT* b,HWND h,const RGNDATA* r,DWORD f) {
+    return rawChainPresent(s,a,b,h,r,f);   // everyone else: unchanged
+}
+// DrawViews (and the swap chains it owns) runs on one thread at a time: the game presents from its render
+// thread AND, on WM_PAINT, from its main thread (exe+0x8ca8f0).
+static SRWLOCK drawLock=SRWLOCK_INIT;
 static ResetFn realReset;
 static PresentFn objectPresent;
 static ResetFn objectReset;
@@ -52,6 +69,11 @@ static void Log(const char* text, unsigned a=0, unsigned b=0) {
     if(f) { fprintf(f,"%llu: ",GetTickCount64()); fprintf(f,text,a,b); fputc('\n',f); fclose(f); }
 }
 #include "Diagnostics.h"
+// A Direct3D object still referenced after we release it makes the next device Reset fail (D3DERR_INVALIDCALL).
+template<class T> static void ReleaseNow(T*& p,const char* what) {
+    if(!p) return; const ULONG left=p->Release(); p=nullptr;
+    if(left) LogF("%s still referenced %lu time(s) after release: a device Reset now fails",what,left);
+}
 static int GameMode();
 // F1: swap which character each display's controllers drive, and swap the two output windows.
 static std::atomic<bool> swapPlayers{false};
@@ -170,11 +192,13 @@ static void ConfigureFusion() {
     Log("v0.2 native viewport capture installed; FusionFix disk file unchanged");
 }
 static void ReleaseChains() {
-    if(movieSnapshot) {movieSnapshot->Release();movieSnapshot=nullptr;}
+    AcquireSRWLockExclusive(&drawLock);   // never free a swap chain another thread is presenting
+    ReleaseNow(movieSnapshot,"Movie copy");
     movieDrawn.store(false);
     lastFrameWasMovie.store(false);
     ReleaseSharedGui();
-    for(int i=0;i<2;++i) { if(chains[i]) chains[i]->Release(); chains[i]=nullptr; chainW[i]=chainH[i]=0; }
+    for(int i=0;i<2;++i) { ReleaseNow(chains[i],i?"Player 2 swap chain":"Player 1 swap chain"); chainW[i]=chainH[i]=0; }
+    ReleaseSRWLockExclusive(&drawLock);
 }
 static int GameMode() {
     if(testMode || manualSplit) return 1;
@@ -332,7 +356,7 @@ static DWORD WINAPI WindowLoop(void*) {
         RECT r={0,0,width,width*9/16}; AdjustWindowRectEx(&r,WS_OVERLAPPEDWINDOW,FALSE,WS_EX_NOACTIVATE);
         int x=area.left+12+(monitors.size()>1?0:i*available/2);
         views[i]=CreateWindowExW(WS_EX_NOACTIVATE,L"Rev2DualWindowsV2",
-            i?L"RE Revelations 2 — Display 2 (v0.6.1)":L"RE Revelations 2 — Display 1 (v0.6.1)",   // same names as the dashboard
+            i?L"RE Revelations 2 — Display 2 (v0.6.2)":L"RE Revelations 2 — Display 1 (v0.6.2)",   // same names as the dashboard
             WS_OVERLAPPEDWINDOW,x,area.top+30,r.right-r.left,r.bottom-r.top,gameWindow,nullptr,selfModule,nullptr);
         if(!views[i])return 2;
         if(HMENU menu=GetSystemMenu(views[i],FALSE)) {
@@ -389,29 +413,50 @@ static void SaveSurface(IDirect3DDevice9* d,IDirect3DSurface9* s,const wchar_t* 
 }
 static void SetShown(bool on) {
     if(on==shown)return;shown=on;
+    if(!on) {AcquireSRWLockExclusive(&viewMapLock); viewMap[0].valid=viewMap[1].valid=false; ReleaseSRWLockExclusive(&viewMapLock);}
     // Async only. Never synchronously call the UI thread from Direct3D hooks.
     if(views[0])PostMessageW(views[0],WM_APP+1,on,0);
     Log(on?"Output windows visible":"Original game view visible");
 }
-static bool EnsureChain(IDirect3DDevice9* d,int i,D3DFORMAT format) {
-    UINT w=std::max(1u,uiWidth[i].load()),h=std::max(1u,uiHeight[i].load());
-    if(chains[i]&&chainW[i]==w&&chainH[i]==h) return true;
+static D3DFORMAT chainFormat[2];
+static UINT chainCreates=0;
+static BOOL CALLBACK LargestMonitor(HMONITOR,HDC,LPRECT r,LPARAM p) {
+    auto& s=*(SIZE*)p; s.cx=std::max(s.cx,r->right-r->left); s.cy=std::max(s.cy,r->bottom-r->top); return TRUE;
+}
+// Each player window gets ONE swap chain, big enough for any size the window takes (largest monitor, and at
+// least 4096x2304, above the 3840x2160 output preset). Resizing, filling, moving or minimizing only changes the rectangle that
+// is drawn and presented (D3DSWAPEFFECT_COPY + source/destination rect), so no Direct3D object is destroyed or
+// created while the game runs. Recreating the chains on every resize (Ctrl+1/2, Ctrl+Alt+1/2, restore) preceded
+// every loading-screen freeze and an NVIDIA driver heap-corruption crash (dumps 2026-11-12).
+// w,h: the window's current client size, the area to draw.
+static bool EnsureChain(IDirect3DDevice9* d,int i,D3DFORMAT format,UINT& w,UINT& h) {
+    w=std::max(1u,uiWidth[i].load()); h=std::max(1u,uiHeight[i].load());
+    if(chains[i]&&chainFormat[i]==format&&w<=chainW[i]&&h<=chainH[i]) return true;
+    SIZE big={4096,2304};   // headroom: a 3840-wide preset window can get a client slightly wider than 3840
+    EnumDisplayMonitors(nullptr,nullptr,LargestMonitor,(LPARAM)&big);
+    const UINT cw=std::max<UINT>(w,big.cx), ch=std::max<UINT>(h,big.cy);
     if(chains[i]) {chains[i]->Release();chains[i]=nullptr;}
     D3DPRESENT_PARAMETERS pp={}; pp.Windowed=TRUE; pp.hDeviceWindow=views[i];
-    pp.BackBufferWidth=w; pp.BackBufferHeight=h; pp.BackBufferFormat=format;
-    pp.BackBufferCount=1; pp.SwapEffect=D3DSWAPEFFECT_DISCARD;
+    pp.BackBufferWidth=cw; pp.BackBufferHeight=ch; pp.BackBufferFormat=format;
+    pp.BackBufferCount=1; pp.SwapEffect=D3DSWAPEFFECT_COPY;
     pp.PresentationInterval=D3DPRESENT_INTERVAL_IMMEDIATE;
     HRESULT hr=d->CreateAdditionalSwapChain(&pp,&chains[i]);
     static HRESULT lastError=S_OK;
     if(FAILED(hr)) { if(hr!=lastError) LogF("CreateAdditionalSwapChain %d failed %08lx (window monitor %p)",i,hr,(void*)MonitorFromWindow(views[i],MONITOR_DEFAULTTONULL)); lastError=hr; return false; }
-    LogF("Swap chain %d created: %ux%u for window %p on monitor %p",i,w,h,(void*)views[i],(void*)MonitorFromWindow(views[i],MONITOR_DEFAULTTONULL));
+    LogF("Swap chain %d created: %ux%u (window %ux%u, %p on monitor %p)",i,cw,ch,w,h,(void*)views[i],(void*)MonitorFromWindow(views[i],MONITOR_DEFAULTTONULL));
     lastError=S_OK;
-    chainW[i]=w; chainH[i]=h; return true;
+    chainW[i]=cw; chainH[i]=ch; chainFormat[i]=format; ++chainCreates; return true;
 }
 static void ForceCoop();
 static void KeyboardForMainOnly();
+static void SkipPaintPresent();
 static void FocusFreeInput();
 static void LogInputState();
+static void CursorFollowsPlayerWindows();
+static void PerPlayerActionGates();
+static void LoadSensitivity();
+static void ToggleSensitivityPanel();
+static BYTE* gameBase;
 static void DrawViews(IDirect3DDevice9* d) {
     ++frames;
     if(frames==1) {
@@ -422,7 +467,11 @@ static void DrawViews(IDirect3DDevice9* d) {
         }
     }
     if(!modeRoot&&!testMode&&frames==1) FindGameMode();
-    if(!testMode&&frames==1) {makeBorderless=true; KeyboardForMainOnly();}   // AutoJoinPartner removed: patching exe+0x8b9507 crashed at startup (ERR09)
+    if(!testMode&&frames==1) {   // AutoJoinPartner removed: patching exe+0x8b9507 crashed at startup (ERR09)
+        makeBorderless=true; KeyboardForMainOnly(); SkipPaintPresent();
+        if(!gameBase) gameBase=(BYTE*)GetModuleHandleW(nullptr);
+        CursorFollowsPlayerWindows(); PerPlayerActionGates(); LoadSensitivity();
+    }
     if(!testMode) {FocusFreeInput(); LogInputState();}
     if(!MakeWindows(d))return;
     if(makeBorderless.exchange(false)&&views[0]) PostMessageW(views[0],WM_APP+2,0,0);
@@ -453,6 +502,7 @@ static void DrawViews(IDirect3DDevice9* d) {
         else Log("F1 ignored: co-op is not on yet (one character)");
     }
     if(active&&(GetAsyncKeyState(VK_F2)&1)) ForceCoop();
+    if(active&&!testMode&&(GetAsyncKeyState(VK_F3)&1)) ToggleSensitivityPanel();
     const int swap=MainView();
     const bool capture=active&&(GetAsyncKeyState(VK_F5)&1);
     int mode=GameMode();
@@ -504,17 +554,20 @@ static void DrawViews(IDirect3DDevice9* d) {
     }
     SetShown(true);
     for(int i=0;i<2;++i) {
-        if(uiMinimized[i].load()||!EnsureChain(d,i,desc.Format)) continue;
+        UINT cw=0,ch=0;
+        if(uiMinimized[i].load()||!EnsureChain(d,i,desc.Format,cw,ch)) continue;
+        const RECT area={0,0,(LONG)cw,(LONG)ch};   // the window's client area inside the larger back buffer
         IDirect3DSurface9* dest=nullptr; if(FAILED(chains[i]->GetBackBuffer(0,D3DBACKBUFFER_TYPE_MONO,&dest))) continue;
-        d->ColorFill(dest,nullptr,D3DCOLOR_XRGB(0,0,0));
+        d->ColorFill(dest,&area,D3DCOLOR_XRGB(0,0,0));
         RECT src=split?regions[i^swap]:RECT{0,0,(LONG)desc.Width,(LONG)desc.Height};
         int sw=src.right-src.left,sh=src.bottom-src.top;
         if(src.left<0||src.top<0||src.right>(LONG)desc.Width||src.bottom>(LONG)desc.Height||sw<=0||sh<=0||abs(sw*9-sh*16)>16){dest->Release();continue;}
-        int w=chainW[i],h=w*9/16;
-        if(h>(int)chainH[i]) {h=chainH[i]; w=h*16/9;}
-        int x=(chainW[i]-w)/2,y=(chainH[i]-h)/2;
+        int w=cw,h=w*9/16;
+        if(h>(int)ch) {h=ch; w=h*16/9;}
+        int x=(cw-w)/2,y=(ch-h)/2;
         RECT dst={x,y,x+w,y+h};
         HRESULT hr=d->StretchRect(frameSource,&src,dest,&dst,D3DTEXF_LINEAR);
+        if(SUCCEEDED(hr)) {AcquireSRWLockExclusive(&viewMapLock); viewMap[i]={src,dst,true}; ReleaseSRWLockExclusive(&viewMapLock);}
         if(SUCCEEDED(hr)&&composite) DrawSharedGui(d,dest,dst);
         const UINT checkBit=1u<<(i+(movie?2:0));
         if(testMode&&frames>20&&!(pixelChecks&checkBit)&&SUCCEEDED(hr)) {
@@ -539,7 +592,7 @@ static void DrawViews(IDirect3DDevice9* d) {
         if(capture) SaveSurface(d,dest,i?L"capture-player2.bmp":L"capture-player1.bmp");
         dest->Release();
         renderSpot=i?"player 2 window Present":"player 1 window Present";
-        if(SUCCEEDED(hr)) hr=chains[i]->Present(nullptr,nullptr,nullptr,nullptr,0);
+        if(SUCCEEDED(hr)) hr=rawChainPresent?rawChainPresent(chains[i],&area,&area,nullptr,nullptr,0):chains[i]->Present(&area,&area,nullptr,nullptr,0);
         renderSpot="DrawViews";
         if(SUCCEEDED(hr)) ++successes;
         else if(frames%120==0) Log("Player %u presentation failed %08x",i+1,hr);
@@ -554,9 +607,16 @@ static void DrawViews(IDirect3DDevice9* d) {
     source->Release();
     if(successes==2) Log("Both player surfaces presented successfully");
 }
+// Never waits: if another thread is already drawing the player windows, this Present just skips them.
+static void DrawViewsOnce(IDirect3DDevice9* d) {
+    renderThreadId=GetCurrentThreadId();
+    if(!TryAcquireSRWLockExclusive(&drawLock)) {renderSpot="game Present (player windows busy on another thread)"; return;}
+    renderSpot="DrawViews"; DrawViews(d); ReleaseSRWLockExclusive(&drawLock);
+    renderSpot="game Present";
+}
 static HRESULT STDMETHODCALLTYPE HookPresent(IDirect3DDevice9* d,const RECT* a,const RECT* b,HWND h,const RGNDATA* r) {
     bool outer=presentDepth++==0;
-    if(outer) {renderThreadId=GetCurrentThreadId(); renderSpot="DrawViews"; DrawViews(d); renderSpot="game Present";}
+    if(outer) DrawViewsOnce(d);
     HRESULT hr=realPresent(d,a,b,h,r);
     if(outer) renderSpot="game frame (outside Present)";
     --presentDepth;
@@ -587,16 +647,35 @@ static bool SameAsNow(IDirect3DDevice9* d,const D3DPRESENT_PARAMETERS* pp) {
         (!pp->EnableAutoDepthStencil||cur.AutoDepthStencilFormat==pp->AutoDepthStencilFormat)&&cur.PresentationInterval==pp->PresentationInterval&&
         (!pp->hDeviceWindow||cur.hDeviceWindow==pp->hDeviceWindow);
 }
+static const char* ModuleOf(const void* p,char (&name)[MAX_PATH]) {
+    HMODULE m=nullptr; name[0]=0;
+    if(p&&GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS|GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,(LPCSTR)p,&m)) GetModuleFileNameA(m,name,MAX_PATH);
+    const char* s=strrchr(name,'\\'); return s?s+1:name[0]?name:"(no module)";
+}
+// D3D9 Reset returns D3DERR_INVALIDCALL when an object in D3DPOOL_DEFAULT (extra swap chain, render target, state
+// block...) is still alive, or a parameter is invalid. A hook another program put on Reset after ours (an overlay)
+// is skipped by the per-device Reset, so it could not free its own objects: the "Reset entry" line shows it.
+static void LogResetFailure(IDirect3DDevice9* d,const D3DPRESENT_PARAMETERS* pp,HRESULT hr,const void* called) {
+    LogF("RESET FAILED %08lx: windowed %d, %ux%u, format %u, buffers %u, multisample %u/%lu, swap effect %u, window %p, "
+         "auto depth %d (format %u), flags %08lx, refresh %u, interval %08x; device state now %08lx",hr,pp->Windowed,
+         pp->BackBufferWidth,pp->BackBufferHeight,pp->BackBufferFormat,pp->BackBufferCount,pp->MultiSampleType,pp->MultiSampleQuality,
+         pp->SwapEffect,(void*)pp->hDeviceWindow,pp->EnableAutoDepthStencil,pp->AutoDepthStencilFormat,pp->Flags,
+         pp->FullScreen_RefreshRateInHz,pp->PresentationInterval,d->TestCooperativeLevel());
+    char a[MAX_PATH],b[MAX_PATH]; const BYTE* entry=(const BYTE*)resetTarget;
+    const void* to=entry&&entry[0]==0xe9?entry+5+*(const int32_t*)(entry+1):nullptr;
+    LogF("Reset path: called %s; Reset entry %s %s",called==(void*)realReset?"d3d9 through the hooks placed before ours":ModuleOf(called,a),to?"jumps to":"is",to?ModuleOf(to,b):"not hooked");
+}
 static HRESULT STDMETHODCALLTYPE HookReset(IDirect3DDevice9* d,D3DPRESENT_PARAMETERS* pp) {
     KeepWindowed(pp);
     if(!testMode&&SameAsNow(d,pp)) {ReleaseChains(); Log("Device reset skipped: same windowed mode %u x %u",pp->BackBufferWidth,pp->BackBufferHeight); return D3D_OK;}
     ReleaseChains(); Log("Device reset: %u x %u",pp->BackBufferWidth,pp->BackBufferHeight);
     Stage("device Reset"); const HRESULT hr=realReset(d,pp); LogF("Device reset result %08lx",hr); stage="device reset done";
+    if(FAILED(hr)) LogResetFailure(d,pp,hr,(void*)realReset);
     return hr;
 }
 static HRESULT STDMETHODCALLTYPE ObjectPresent(IDirect3DDevice9* d,const RECT* a,const RECT* b,HWND h,const RGNDATA* r) {
     bool outer=presentDepth++==0;
-    if(outer) {renderThreadId=GetCurrentThreadId(); renderSpot="DrawViews"; DrawViews(d); renderSpot="game Present";}
+    if(outer) DrawViewsOnce(d);
     HRESULT hr=objectPresent(d,a,b,h,r);
     if(outer) renderSpot="game frame (outside Present)";
     --presentDepth;
@@ -606,7 +685,9 @@ static HRESULT STDMETHODCALLTYPE ObjectPresent(IDirect3DDevice9* d,const RECT* a
 static HRESULT STDMETHODCALLTYPE ObjectReset(IDirect3DDevice9* d,D3DPRESENT_PARAMETERS* pp) {
     ReleaseChains();Log("Object device reset %u x %u",pp->BackBufferWidth,pp->BackBufferHeight); KeepWindowed(pp);
     if(!testMode&&SameAsNow(d,pp)) {Log("Device reset skipped: same windowed mode"); AttachDevice(d); return D3D_OK;}
-    Stage("device Reset"); HRESULT hr=objectReset(d,pp); LogF("Device reset result %08lx",hr); stage="device reset done"; AttachDevice(d);return hr;
+    Stage("device Reset"); HRESULT hr=objectReset(d,pp); LogF("Device reset result %08lx",hr); stage="device reset done";
+    if(FAILED(hr)) LogResetFailure(d,pp,hr,(void*)objectReset);
+    AttachDevice(d);return hr;
 }
 static void AttachDevice(IDirect3DDevice9* d) {
     void** vt=*(void***)d;
@@ -630,10 +711,53 @@ static void AttachDevice(IDirect3DDevice9* d) {
 // whose pad slot is the main slot (sBioPad+0xba0, the player on the mouse + keyboard display), 0 for the
 // other. exe+0x9886a7 (the per-frame mode chooser forcing controller in co-op) jumps to ChooseIdleMode so
 // menus keep mouse + keyboard. Replaces the earlier 22 single-check patches.
-static BYTE* gameBase;
 static bool KeyboardOwnsCoop(){return deviceDisplay[DevKeyboard]!=0&&CoopOn();}
+// ---- One display with mouse + keyboard AND a controller: its player switches freely (2026-11-12) ----
+// The hooks below set the game's single global mode per player, and the mouse + keyboard player always got
+// mode 1. A controller placed on the same display already fed that character's pad slot (PadsFor), but with
+// mode 1 the game never read it. Now that display's last-used device decides: a NEW controller press (button,
+// trigger, or stick past setup::Pressed's drift threshold) switches it to the controller; a new key, mouse
+// button, wheel or mouse movement switches it back. Only new presses switch, so a held stick or trigger never
+// makes it flicker. The other display is never affected.
+static CRITICAL_SECTION buildLock;   // the mode is global: never let two players' builds overlap (re-entrant)
+static std::atomic<bool> keyboardDisplayOnPad{false};
+static unsigned PadsWithKeyboard() {   // bit p set = controller p is on the mouse + keyboard display
+    unsigned m=0;
+    if(deviceDisplay[DevKeyboard]) for(int p=0;p<2;++p) if(deviceDisplay[DevPad1+p]==deviceDisplay[DevKeyboard]) m|=1u<<p;
+    return m;
+}
+static bool NextOnPad(bool onPad,bool padPress,bool keyboardPress) {return padPress!=keyboardPress?padPress:onPad;}   // both at once: keep
+static bool KeyboardInUse() {return !keyboardDisplayOnPad.load();}
+static bool ReadPtr(uintptr_t at,uintptr_t& v);
+static void SenseKeyboardDisplayDevice() {   // game thread, under buildLock
+    const unsigned pads=PadsWithKeyboard();
+    if(!pads||!realGetState) {keyboardDisplayOnPad=false; return;}
+    static bool padWas[2]; static DWORD keysWas[8],buttonsWas;
+    bool padPress=false,keyPress=false;
+    for(int p=0;p<2;++p) if(pads>>p&1) {
+        PadState st={}; const bool down=realGetState(p,&st)==ERROR_SUCCESS&&setup::Pressed(st);
+        padPress|=down&&!padWas[p]; padWas[p]=down;
+    }
+    uintptr_t keyboard=0,mouse=0; DWORD keys[8],buttons=0; int move[3];
+    if(ReadPtr((uintptr_t)gameBase+0x11de918,keyboard)&&ReadGame(keyboard+0x120,keys,sizeof(keys))) {   // key bits the game's own chooser reads (exe+0x588637)
+        for(int k=0;k<8;++k) keyPress|=(keys[k]&~keysWas[k])!=0;
+        memcpy(keysWas,keys,sizeof(keys));
+    }
+    if(ReadPtr((uintptr_t)gameBase+0x11de940,mouse)) {
+        if(ReadGame(mouse+0x2c,move,sizeof(move))) keyPress|=abs(move[0])+abs(move[1])>=2||move[2]!=0;   // dx, dy, wheel (as exe+0x588664)
+        if(ReadGame(mouse+0x38,&buttons,4)) {keyPress|=(buttons&~buttonsWas)!=0; buttonsWas=buttons;}   // +0x38 now, +0x3c before (exe+0x8276b0)
+    }
+    const bool onPad=NextOnPad(keyboardDisplayOnPad.load(),padPress,keyPress);
+    if(onPad!=keyboardDisplayOnPad.load()) {
+        keyboardDisplayOnPad=onPad;
+        static unsigned logged=0;
+        if(++logged<=200) LogF("Display %d player now uses %s",deviceDisplay[DevKeyboard],onPad?"its controller":"mouse + keyboard");
+    }
+}
 extern "C" void __cdecl ChooseIdleMode(BYTE* self) {
-    const bool keyboard=KeyboardOwnsCoop();
+    const bool coop=KeyboardOwnsCoop();
+    if(coop) {EnterCriticalSection(&buildLock); SenseKeyboardDisplayDevice(); LeaveCriticalSection(&buildLock);}
+    const bool keyboard=coop&&KeyboardInUse();   // menus follow the mouse + keyboard display's current device
     *(int*)(self+0x15c4bc)=keyboard?1:0; *(int*)(self+0x15c4c0)=keyboard?2:0;
 }
 extern "C" void ModeIdleStub();
@@ -642,8 +766,6 @@ asm(".globl _ModeIdleStub\n_ModeIdleStub:\n pushal\n mov %esp,%ebp\n sub $512,%e
     " push 4(%ebp)\n call _ChooseIdleMode\n add $4,%esp\n fxrstor (%esp)\n mov %ebp,%esp\n popal\n pop %esi\n ret\n");
 using BuildInputFn=int(__fastcall*)(void*,void*,BYTE*);
 static BuildInputFn realBuildInput=nullptr;
-static CRITICAL_SECTION buildLock;   // the mode is global: never let two players' builds overlap (re-entrant)
-static bool ReadPtr(uintptr_t at,uintptr_t& v);
 // The mouse + keyboard player is the character shown on the mouse + keyboard display. Window w shows region
 // w^MainView(), and MainView() puts region 0 on the keyboard's display, so that is region 0, or region 1
 // after F1. PadsFor() routes each controller to the character on its display the same way.
@@ -662,15 +784,48 @@ static void LogPlayer(BYTE* player,unsigned number,unsigned keyboard) {
     Log("  -> display %d",region<0?-1:(region^MainView())+1);
     Log("  -> mouse+keyboard %u (player index %u)",keyboard,player[0x790c]);
 }
+// ---- Mouse camera sensitivity (F3 panel, decompiled 2026-11-13) ----
+// Mouse look exists only inside this builder (exe+0x6155c2): with mode 1 it turns the mouse movement of this
+// frame ([mouse+0x2c] dx, [mouse+0x30] dy, ints) into the right-stick direction and strength that camera and
+// aiming use. Menus take the Windows cursor position instead (exe+0x8278a8), the controller player never has
+// mode 1. Scaling dx/dy for this one build therefore changes camera and aim only, exactly once per frame.
+static std::atomic<float> mouseSensitivity{1.0f};
+static float ClampSensitivity(float s) {return s==s?std::clamp(s,0.1f,3.0f):1.0f;}   // NaN -> default
+static int ScaleDelta(int d,float s,float& rest) {const float v=d*s+rest; const int out=(int)v; rest=v-out; return out;}   // keeps fractions: slow moves still turn
+struct MouseScale {
+    int* d=nullptr; int saved[2]={0,0},scaled[2]={0,0};
+    MouseScale(BYTE* player,int mode) {
+        const float s=sensitivityPanelOpen.load()?0.0f:mouseSensitivity.load(); uintptr_t mouse=0;   // panel open: camera holds still
+        if(s==1.0f||mode!=1||!player||*(int*)(player+0x7920)!=0||!ReadPtr((uintptr_t)gameBase+0x11de940,mouse)) return;
+        static float rest[2];
+        d=(int*)(mouse+0x2c); saved[0]=d[0]; saved[1]=d[1];
+        d[0]=scaled[0]=ScaleDelta(saved[0],s,rest[0]); d[1]=scaled[1]=ScaleDelta(saved[1],s,rest[1]);
+    }
+    ~MouseScale() {if(d) for(int k=0;k<2;++k) if(d[k]==scaled[k]) d[k]=saved[k];}   // a newer mouse read is left alone
+};
+static void LogAim(BYTE* player) {   // diagnostics: per character, when its aim flag ([uPlayer+0x78e8] bit 2) changes
+    static BYTE* seen[4]; static unsigned last[4],lines=0;
+    const unsigned aim=*(DWORD*)(player+0x78e8)>>2&1;
+    for(int k=0;k<4;++k) {
+        if(seen[k]&&seen[k]!=player) continue;
+        if(seen[k]==player&&last[k]==aim) return;
+        seen[k]=player; last[k]=aim;
+        if(++lines<=400) LogF("Aim: character %u (%s) aim flag %u",player[0x790c],IsKeyboardPlayer(player)?"mouse + keyboard display":"controller display",aim);
+        return;
+    }
+}
 static int __fastcall HookBuildInput(void* self,void* edx,BYTE* player) {
     uintptr_t input=0;
-    if(!player||!KeyboardOwnsCoop()||!ReadPtr((uintptr_t)gameBase+0x117d120,input)) return realBuildInput(self,edx,player);
+    const bool haveInput=ReadPtr((uintptr_t)gameBase+0x117d120,input);
+    if(!player||!KeyboardOwnsCoop()||!haveInput) {MouseScale s(player,haveInput?*(int*)(input+0x15c4bc):0); return realBuildInput(self,edx,player);}
     const bool keyboard=IsKeyboardPlayer(player);
-    LogPlayer(player,player[0x7924],keyboard);
+    LogPlayer(player,player[0x7924],keyboard); LogAim(player);
     int* mode=(int*)(input+0x15c4bc);
     EnterCriticalSection(&buildLock);
-    const int saved=*mode; *mode=keyboard?1:0;
-    const int r=realBuildInput(self,edx,player);
+    if(keyboard) SenseKeyboardDisplayDevice();
+    const int saved=*mode; *mode=keyboard&&KeyboardInUse()?1:0;
+    int r;
+    {MouseScale s(player,*mode); r=realBuildInput(self,edx,player);}
     *mode=saved;
     LeaveCriticalSection(&buildLock);
     return r;
@@ -683,7 +838,7 @@ using UsesKeyboardFn=bool(__fastcall*)(void*,void*,BYTE*);
 static UsesKeyboardFn realUsesKeyboard=nullptr;
 static bool __fastcall HookUsesKeyboard(void* self,void* edx,BYTE* player) {
     if(!player||!KeyboardOwnsCoop()) return realUsesKeyboard(self,edx,player);
-    return *(int*)(player+0x7920)==0&&IsKeyboardPlayer(player);
+    return *(int*)(player+0x7920)==0&&IsKeyboardPlayer(player)&&KeyboardInUse();
 }
 // ---- Interactions and button prompts use the same global mode, outside the builder (decompiled) ----
 // exe+0x40edc0 is the action check behind pickups, doors and other context actions. It gets a character id
@@ -707,7 +862,7 @@ struct PlayerMode {   // sets the global mode for one on-screen human player whi
         if(!player||!KeyboardOwnsCoop()||((uintptr_t)player!=RegionPlayer(0)&&(uintptr_t)player!=RegionPlayer(1))||
            *(int*)(player+0x7920)!=0||!ReadPtr((uintptr_t)gameBase+0x117d120,input)) return;
         EnterCriticalSection(&buildLock);
-        mode=(int*)(input+0x15c4bc); saved=*mode; *mode=IsKeyboardPlayer(player)?1:0;
+        mode=(int*)(input+0x15c4bc); saved=*mode; *mode=IsKeyboardPlayer(player)&&KeyboardInUse()?1:0;
     }
     ~PlayerMode() {if(mode) {*mode=saved; LeaveCriticalSection(&buildLock);}}
     int Used() const {return mode?*mode:-1;}
@@ -827,6 +982,354 @@ static bool WriteCode(BYTE* at,const BYTE* bytes,size_t n) {
 static void Jump(BYTE* at,void* to,BYTE opcode,size_t total) {   // call/jmp rel32, rest NOPs
     BYTE code[16]; memset(code,0x90,total); code[0]=opcode; *(int32_t*)(code+1)=(int32_t)((BYTE*)to-(at+5)); WriteCode(at,code,total);
 }
+// ---- Partner's inventory took the mouse away (decompiled 2026-11-12) ----
+// Every frame the mouse update (exe+0x679490) calls exe+0x679600, which decides if the mouse is captured
+// (mouse+0x29) or shows the menu cursor (cursor object mouse+0x144). It asks exe+0x2e6a70 for "the human
+// player" = the FIRST human in the player list (uPlayer+0x7920 == 0), then exe+0x301f70(player) = "that
+// player has a menu open" (+0x7448/+0x744c, e.g. the inventory). In co-op both characters are human, so when
+// the first one is the controller player, opening its inventory released the mouse and showed the cursor.
+// Then the input builder (exe+0x615bd3) zeroes mouse look while the cursor is shown (exe+0x679450): the mouse
+// player lost the camera. exe+0xd2d0 / exe+0xd740 (keyboard key checks) block keys the same way.
+// Fix: at those 3 call sites only, "the human player" is the mouse + keyboard player (the character on the
+// mouse + keyboard display, follows F1). Its own menus still release the mouse as before.
+static uintptr_t KeyboardRegionPlayer() {return RegionPlayer(swapPlayers.load()?1:0);}
+using FirstHumanFn=BYTE* (__fastcall*)(void*);
+static FirstHumanFn firstHuman;
+static BYTE* __fastcall KeyboardHuman(void* list) {
+    if(KeyboardOwnsCoop()) if(const uintptr_t kb=KeyboardRegionPlayer()) if(*(int*)(kb+0x7920)==0) return (BYTE*)kb;
+    return firstHuman(list);
+}
+static BYTE* __fastcall CaptureHuman(void* list) {   // mouse-capture site: same answer, logs when the choice matters
+    BYTE* used=KeyboardHuman(list); BYTE* first=firstHuman(list);
+    using MenuFn=bool (__fastcall*)(BYTE*); const auto menuOpen=(MenuFn)(gameBase+0x301f70);
+    const unsigned state=(used&&menuOpen(used))|(first&&menuOpen(first))<<1|(used!=first)<<2;
+    static unsigned last=~0u;
+    if(state!=last) {
+        last=state;
+        LogF("Mouse capture follows player %p (menu open %u); game's first human %p (menu open %u)",
+             (void*)used,state&1,(void*)first,(state>>1)&1);
+    }
+    return used;
+}
+static void MenuChecksForKeyboardPlayer() {
+    firstHuman=(FirstHumanFn)(gameBase+0x2e6a70);
+    const struct {DWORD rva; void* to;} sites[]={{0x67966a,(void*)CaptureHuman},{0xd31e,(void*)KeyboardHuman},{0xd78e,(void*)KeyboardHuman}};
+    unsigned on=0;
+    for(auto& s:sites) {
+        BYTE* at=gameBase+s.rva;
+        if(at[0]!=0xe8||at+5+*(int32_t*)(at+1)!=(BYTE*)firstHuman) {LogF("Menu check at exe+%x: game code differs, not patched",s.rva);continue;}
+        Jump(at,s.to,0xe8,5); ++on;
+    }
+    LogF("Menu checks follow the mouse + keyboard player: %u of 3 sites",on);
+}
+// ---- Mouse + keyboard leaked into the controller player's inventory (decompiled 2026-11-12) ----
+// Every menu (uBioGUI: inventory uGUIInventoryCampaign, pause menu uGUICommonMenu...) has an owner: virtual
+// method 54 (exe+0x48e230) = [menu+0x2ac] in co-op, the character it belongs to (the pause menu gets whoever
+// paused, exe+0x4ba036). Menus read their buttons through methods 56/57 (exe+0x568590 pressed, exe+0x568560
+// repeat) -> the GUI manager [0x15de768] exe+0x554db0 / exe+0x554c60, which return
+//   the OWNER's controller (sBioPad exe+0x696970 / exe+0x696830, slot = sBioPad+0xba0[owner])
+//   | mouse buttons (left = confirm, right = cancel; not mode-gated)
+//   | keyboard menu keys (key config 0x32..0x3c) when the GLOBAL mode is 1.
+// The controller part follows the owner; the mouse and keyboard parts don't. With mouse + keyboard live, the
+// keyboard player's keys and clicks also drove the controller player's inventory. Inside the menu's update
+// (base update exe+0x568eb0 -> state functions, inventory table exe+0xf9c930) the inventory also selects items
+// under the mouse cursor when the global sub-mode is 2 (exe+0x4f5d5c, exe+0x4f63d4), and ignores its own
+// confirm while the left mouse button is held (exe+0x5556b0, exe+0x4f65dc).
+// Fix: a per-player menu owned by the player who is NOT on mouse + keyboard right now gets only its owner's
+// controller buttons (exactly the game's own controller part), and its update runs with the global mode and
+// sub-mode set to controller and "mouse button held" off. The mouse + keyboard player's own menus, the mouse
+// capture fix above and every other menu are unchanged.
+static const struct {DWORD vt; const char* name;} playerMenus[]={   // vtables (exe+rva), from the game's type info
+    {0xf9ccc8,"inventory"},{0xf9d5e8,"key items"},{0xf9d408,"item pickup"},{0xf9ae20,"weapon select"},
+    {0xf9afb0,"weapon shortcut"},{0xf9e0f0,"map"},{0xf95070,"pause menu"},{0xf96858,"weapon upgrade"},
+    {0xf91c80,"appraise popup"},{0xfa0240,"puzzle"}};
+// -1: not an on-screen human player (game's own input), 0: mouse + keyboard (+ that display's controller), 1: controller only
+static int MenuPadOnly(BYTE* player) {
+    if(!player||((uintptr_t)player!=RegionPlayer(0)&&(uintptr_t)player!=RegionPlayer(1))||*(int*)(player+0x7920)!=0) return -1;
+    return IsKeyboardPlayer(player)&&KeyboardInUse()?0:1;
+}
+static int MenuRoute(BYTE* gui,const char*& name,int& owner) {
+    name=nullptr; owner=-1;
+    if(!gui||!KeyboardOwnsCoop()) return -1;
+    const uintptr_t vt=*(uintptr_t*)gui-(uintptr_t)gameBase;
+    for(auto& m:playerMenus) if(vt==m.vt) name=m.name;
+    if(!name) return -1;
+    owner=((int(__fastcall*)(BYTE*,void*))(*(void***)gui)[54])(gui,nullptr);
+    BYTE* player=PlayerById(owner); const int route=MenuPadOnly(player);
+    static BYTE* seen[16]; static int seenRoute[16]; static unsigned lines=0;   // diagnostics: per menu, when its route changes (F1 too)
+    for(int k=0;k<16;++k) {
+        if(seen[k]&&seen[k]!=gui) continue;
+        if(seen[k]==gui&&seenRoute[k]==route) break;
+        seen[k]=gui; seenRoute[k]=route;
+        int region=-1; OnScreenPlayer((uintptr_t)player,&region);
+        if(++lines<=300) LogF("Menu: %s %p of character %d (display %d, F1 %u) -> %s, XInput %d",name,(void*)gui,owner,
+            region<0?-1:(region^MainView())+1,swapPlayers.load()?1:0,route==1?"controller only":route==0?"mouse + keyboard and that display's controller":"game's own input",
+            region<0?-1:RegionXInput(region));
+        break;
+    }
+    return route;
+}
+static void LogMenuInput(const char* what,const char* name,int owner,int bits) {   // diagnostics, bounded
+    static unsigned lines=0; static int last=0;
+    if(bits==last||++lines>300) return; last=bits;
+    LogF("Menu: %s %08x, %s of character %d",what,bits,name,owner);
+}
+using MenuInputFn=int(__fastcall*)(BYTE*,void*);
+static MenuInputFn realMenuInput[2];
+template<int Repeat> static int __fastcall HookMenuInput(BYTE* gui,void* edx) {
+    const int all=realMenuInput[Repeat](gui,edx);
+    const char* name; int owner;
+    if(MenuRoute(gui,name,owner)!=1||!gui[0x2b9]) return all;   // [gui+0x2b9] off: the game returns 0 itself
+    void* pads=*(void**)(gameBase+0x11de5dc); const BYTE* manager=*(BYTE**)(gameBase+0x11de768);
+    using PadBitsFn=int(__fastcall*)(void*,void*,int,int);
+    const int own=pads&&manager&&manager[0x16c4]?((PadBitsFn)(gameBase+(Repeat?0x696830:0x696970)))(pads,nullptr,owner,0):0;
+    if(all&~own) LogMenuInput("blocked mouse/keyboard buttons",name,owner,all&~own);
+    else if(own&&!Repeat) LogMenuInput("controller buttons",name,owner,own);
+    return own;
+}
+static thread_local const char* padOnlyMenu=nullptr;   // set while a controller-only menu updates
+static thread_local int padOnlyOwner=-1;
+using MenuUpdateFn=int(__fastcall*)(BYTE*,void*);
+static MenuUpdateFn realMenuUpdate;
+static int __fastcall HookMenuUpdate(BYTE* gui,void* edx) {
+    const char* name; int owner; uintptr_t input=0;
+    if(MenuRoute(gui,name,owner)!=1||!ReadPtr((uintptr_t)gameBase+0x117d120,input)) return realMenuUpdate(gui,edx);
+    EnterCriticalSection(&buildLock);
+    int* mode=(int*)(input+0x15c4bc); const int m=mode[0],sub=mode[1];   // +0x15c4bc mode, +0x15c4c0 sub-mode
+    mode[0]=mode[1]=0;
+    const char* outer=padOnlyMenu; const int outerOwner=padOnlyOwner; padOnlyMenu=name; padOnlyOwner=owner;
+    const int r=realMenuUpdate(gui,edx);
+    padOnlyMenu=outer; padOnlyOwner=outerOwner; mode[0]=m; mode[1]=sub;
+    LeaveCriticalSection(&buildLock);
+    return r;
+}
+using MouseHeldFn=bool(__cdecl*)();
+static MouseHeldFn realMouseHeld;
+static bool __cdecl HookMouseHeld() {
+    const bool held=realMouseHeld();
+    if(!padOnlyMenu) return held;
+    if(held) LogMenuInput("blocked mouse button held",padOnlyMenu,padOnlyOwner,1);
+    return false;
+}
+static void PerPlayerMenus() {
+    const struct {DWORD rva; const char* bytes; int n; void* hook; void** real; const char* name;} sites[]={
+        {0x568590,"\x80\xb9\xb9\x02\x00\x00\x00\xc6\x81\xb8\x02\x00\x00\x01",14,(void*)HookMenuInput<0>,(void**)&realMenuInput[0],"menu buttons pressed"},
+        {0x568560,"\x80\xb9\xb9\x02\x00\x00\x00\xc6\x81\xb8\x02\x00\x00\x01",14,(void*)HookMenuInput<1>,(void**)&realMenuInput[1],"menu buttons repeat"},
+        {0x568eb0,"\xa1\xf8\xe6\x5d\x01\x53\x80\x78\x34\x00",10,(void*)HookMenuUpdate,(void**)&realMenuUpdate,"menu update"},
+        {0x5556b0,"\xa1\x20\xd1\x57\x01\x83\x78\x50\x00",9,(void*)HookMouseHeld,(void**)&realMouseHeld,"menu mouse button"},
+    };
+    static const char padBits[]="\x80\xb9\xc0\x0b\x00\x00\x00\x8b\x44\x24\x04\x8b\x94\x81";   // sBioPad pressed / repeat readers
+    if(memcmp(gameBase+0x696970,padBits,14)||memcmp(gameBase+0x696830,padBits,14)) {Log("Per-player menus: game code differs, not hooked");return;}
+    unsigned on=0;
+    for(auto& s:sites) {
+        BYTE* at=gameBase+s.rva;
+        if(memcmp(at,s.bytes,s.n)) {LogF("Per-player menus: %s: game code differs, not hooked",s.name);continue;}
+        if(MH_CreateHook(at,s.hook,s.real)!=MH_OK||MH_EnableHook(at)!=MH_OK) {LogF("Per-player menus: %s: hook failed",s.name);continue;}
+        ++on;
+    }
+    LogF("Per-player menus (only the owner's devices): %u of 4 hooks on",on);
+}
+// ---- Menu cursor reached only part of the inventory / key-binding list (decompiled 2026-11-13) ----
+// The mouse update (exe+0x8273e0) places the menu cursor from the WINDOWS cursor: exe+0x8277a0 calls
+// GetCursorPos + ScreenToClient(game window) (exe+0x8278be), then cursor = (client - viewport.left) * W /
+// viewport width (exe+0x8278e8; viewport = [[0x15e0388]+0xa4], W = [+0xb8]). exe+0x82745d does the same to
+// decide "cursor outside the game picture" (shows the Windows arrow via exe+0x876820). The game window is the
+// hidden one behind the player windows (log: 3840x1100 at -960,-540), not the window the player looks at, so
+// only the part of the screen that overlaps it reached the menus and the top/left of full-screen menus (the
+// first key bindings) was off-screen. Fix: both points come from the player window instead: the cursor's spot in
+// the mouse + keyboard player's window (or the window under it outside co-op) -> the back-buffer pixel that
+// window shows there (clamped to its picture) -> the client point the game's own formula turns into that pixel.
+// exe+0x82768b (ClipCursor) is left as the game does it, except while the F3 panel is open (cursor free).
+static POINT WindowToBackBuffer(const RECT& src,const RECT& dst,POINT p) {
+    const LONG dw=std::max(1L,dst.right-dst.left),dh=std::max(1L,dst.bottom-dst.top);
+    p.x=std::clamp(p.x,dst.left,dst.left+dw-1); p.y=std::clamp(p.y,dst.top,dst.top+dh-1);
+    return {src.left+(LONG)((int64_t)(p.x-dst.left)*(src.right-src.left)/dw),src.top+(LONG)((int64_t)(p.y-dst.top)*(src.bottom-src.top)/dh)};
+}
+static LONG GameClientFor(LONG pixel,LONG from,LONG to,UINT backBuffer) {return from+(LONG)((int64_t)pixel*(to-from)/(LONG)std::max(1u,backBuffer));}
+static int CursorWindow(POINT screen) {
+    if(KeyboardOwnsCoop()) return (swapPlayers.load()?1:0)^MainView();   // window showing the mouse + keyboard player (follows F1)
+    for(int i=0;i<2;++i) {RECT r; if(views[i]&&IsWindowVisible(views[i])&&GetWindowRect(views[i],&r)&&PtInRect(&r,screen)) return i;}
+    return deviceDisplay[DevKeyboard]?deviceDisplay[DevKeyboard]-1:0;
+}
+static bool CursorOnBackBuffer(POINT screen,POINT& pixel,bool& inside,int& window) {
+    if(testMode||!uiReady.load()||!enabled.load()) return false;
+    window=CursorWindow(screen); if(window<0||window>1||!views[window]||IsIconic(views[window])) return false;
+    AcquireSRWLockShared(&viewMapLock); const ViewMap m=viewMap[window]; ReleaseSRWLockShared(&viewMapLock);
+    POINT p=screen; if(!m.valid||!ScreenToClient(views[window],&p)) return false;
+    inside=PtInRect(&m.dst,p)!=0; pixel=WindowToBackBuffer(m.src,m.dst,p); return true;
+}
+static void LogCursor(const char* what,int window,bool inside,POINT pixel) {   // diagnostics: on change, bounded
+    static int lastWindow=-2,lastInside=-1; static unsigned lines=0; static DWORD lastTick=0;
+    const DWORD now=GetTickCount();
+    if((window==lastWindow&&(int)inside==lastInside&&now-lastTick<3000)||++lines>400) return;
+    lastWindow=window; lastInside=inside; lastTick=now;
+    LogF("Menu cursor (%s): window %d (Display %d), over its picture %u, frame pixel %ld,%ld",what,window,window+1,inside?1:0,pixel.x,pixel.y);
+}
+static BOOL WINAPI CursorOverPicture(HWND h,LPPOINT p) {   // exe+0x82745d
+    const POINT screen=*p; const BOOL ok=ScreenToClient(h,p); POINT pixel; bool inside; int w; RECT c;
+    if(ok&&CursorOnBackBuffer(screen,pixel,inside,w)&&GetClientRect(h,&c)) {
+        *p=inside?POINT{(c.left+c.right)/2,(c.top+c.bottom)/2}:POINT{c.left-1,c.top-1};
+        LogCursor("over picture",w,inside,pixel);
+    }
+    return ok;
+}
+static BOOL WINAPI CursorPosition(HWND h,LPPOINT p) {   // exe+0x8278be
+    const POINT screen=*p; const BOOL ok=ScreenToClient(h,p); POINT pixel; bool inside; int w;
+    if(!ok||!CursorOnBackBuffer(screen,pixel,inside,w)) return ok;
+    RECT vp={}; uintptr_t render=0;   // the viewport the game divides by (exe+0x8277a9: render object, else globals)
+    const bool have=ReadPtr((uintptr_t)gameBase+0x11e0388,render)?ReadGame(render+0xa4,&vp,sizeof(vp)):ReadGame((uintptr_t)gameBase+0x11ddff0,&vp,sizeof(vp));
+    if(!have||vp.right<=vp.left||vp.bottom<=vp.top) return ok;
+    p->x=GameClientFor(pixel.x,vp.left,vp.right,sourceWidth); p->y=GameClientFor(pixel.y,vp.top,vp.bottom,sourceHeight);
+    return ok;
+}
+static BOOL WINAPI GameClipCursor(const RECT* r) {return ClipCursor(r);}   // exe+0x82768b
+static void CursorFollowsPlayerWindows() {
+    const struct {DWORD rva; DWORD iat; void* to; const char* name;} sites[]={
+        {0x82745d,0xe3f348,(void*)CursorOverPicture,"cursor over picture"},{0x8278be,0xe3f348,(void*)CursorPosition,"cursor position"},
+        {0x82768b,0xe3f374,(void*)GameClipCursor,"cursor clip"}};
+    unsigned on=0;
+    for(auto& s:sites) {
+        BYTE* at=gameBase+s.rva;
+        if(at[0]!=0xff||at[1]!=0x15||*(DWORD*)(at+2)!=(DWORD)(uintptr_t)(gameBase+s.iat)) {LogF("Menu cursor: %s: game code differs, not patched",s.name);continue;}
+        Jump(at,s.to,0xe8,6); ++on;
+    }
+    LogF("Menu cursor follows the player windows: %u of 3 sites",on);
+}
+// ---- One player's aiming blocked the other player's inventory (decompiled 2026-11-13) ----
+// The input builder runs once per player (exe+0x6152d0, cPadEx). Its inventory-button handler exe+0x617b40
+// (keys 0x33/0x34/0x35 or the pad's inventory button -> exe+0x711ca0 tab, [cPadEx+0x2e] open request) first
+// checks the FIRST human character in the player list (exe+0x617b56 -> exe+0x2e6a70): its state [+0xc]&7 must be
+// 1 or 2 and its flag [+0x78e8] bit 2 must be clear; only then "can open inventory" (exe+0x303980) for the player
+// being built. Bit 2 is the flag that also blocks a player's own quick heal / weapon switch while aiming
+// (exe+0x61791d, exe+0x617726). In co-op the first human is always character 0 (Barry / Claire): while it aims,
+// character 1's inventory (and healing from it) is refused; character 1 aiming never blocks character 0. That is
+// the reported pattern, whatever the devices. Fix: that one call returns the player being built (edi there)
+// when it is human, so each player's own aim/state decides. Single player: same character, no change.
+// Not changed: the pause menu opener (exe+0x556b30) has the same first-human check (pause is refused while
+// character 0 aims); the quick heal button (exe+0x617670 -> exe+0x311cb0) checks only the healer's own state.
+using FirstHumanList=BYTE* (__fastcall*)(void*);
+static BYTE* GatePlayer(BYTE* player,BYTE* first) {return player&&*(int*)(player+0x7920)==0?player:first;}
+static bool InventoryGateBlocks(BYTE* p) {if(!p) return true; const int s=*(int*)(p+0xc)&7; return (s!=1&&s!=2)||(*(DWORD*)(p+0x78e8)>>2&1);}
+extern "C" BYTE* __cdecl InventoryGatePlayer(void* list,BYTE* player) {
+    BYTE* first=((FirstHumanList)(gameBase+0x2e6a70))(list); BYTE* used=GatePlayer(player,first);
+    if(used!=first&&used&&first) {   // diagnostics: when the old check would have decided differently
+        static unsigned lastState=~0u,lines=0;
+        const unsigned state=InventoryGateBlocks(first)|InventoryGateBlocks(used)<<1|(unsigned)used[0x790c]<<2;
+        if(state!=lastState&&(state&1)!=((state>>1)&1)&&++lines<=300)
+            LogF("Inventory button of character %u: decided by its own state (blocked %u); character %u's state would have %s it",
+                 used[0x790c],(state>>1)&1,first[0x790c],state&1?"BLOCKED":"allowed");
+        lastState=state;
+    }
+    return used;
+}
+extern "C" void InventoryGateStub();
+asm(".globl _InventoryGateStub\n_InventoryGateStub:\n push %ecx\n push %edx\n push %edi\n push %ecx\n call _InventoryGatePlayer\n add $8,%esp\n pop %edx\n pop %ecx\n ret\n");
+using HealRequestFn=int(__fastcall*)(BYTE*,void*,int,int);
+static HealRequestFn realHealRequest;
+static int __fastcall HookHealRequest(BYTE* player,void* edx,int kind,int flag) {   // diagnostics only: quick heal/item button reached the game
+    static unsigned lines=0;
+    if(++lines<=300) {
+        BYTE* other=(BYTE*)RegionPlayer(0); if(other==player) other=(BYTE*)RegionPlayer(1);
+        LogF("Quick heal/item button: character %u, kind %d, own aim %u, other character aim %d",player[0x790c],kind,
+             *(DWORD*)(player+0x78e8)>>2&1,other&&other!=player?(int)(*(DWORD*)(other+0x78e8)>>2&1):-1);
+    }
+    return realHealRequest(player,edx,kind,flag);
+}
+static void PerPlayerActionGates() {
+    BYTE* at=gameBase+0x617b56;
+    if(at[0]!=0xe8||at+5+*(int32_t*)(at+1)!=gameBase+0x2e6a70) Log("Inventory gate: game code differs, not patched");
+    else {Jump(at,(void*)InventoryGateStub,0xe8,5); Log("Inventory button uses each player's own aim/state: on");}
+    BYTE* heal=gameBase+0x311cb0;
+    if(memcmp(heal,"\x56\x8b\xf1\x83\xbe\x08\x1a\x00\x00\x00",10)) Log("Quick heal log: game code differs, not hooked");
+    else if(MH_CreateHook(heal,HookHealRequest,(void**)&realHealRequest)!=MH_OK||MH_EnableHook(heal)!=MH_OK) Log("Quick heal log: hook failed");
+}
+// ---- F3: mouse camera sensitivity panel ----
+// Keyboard only: Left/Right or A/D change it by 0.01 (hold to repeat), R resets, Esc or F3 closes.
+// The panel never takes focus or mouse clicks (keys are read with GetAsyncKeyState), so the game keeps its
+// window and mouse capture. While it is open the game gets no mouse or keyboard input from the mouse +
+// keyboard player (HookDeviceState); the controller player keeps playing.
+// Saved as [Mouse] MouseCameraSensitivity in scripts\ResidentEvilRevelations2.DualWindows.ini.
+static std::atomic<HWND> sensitivityPanel{nullptr};
+enum {PanelBar=1,PanelText,PanelToggle=WM_APP+5,PanelTimer=7};
+static void SaveSensitivity() {
+    wchar_t ini[MAX_PATH],v[16]; setup::IniPath(ini); swprintf_s(v,L"%.2f",mouseSensitivity.load());
+    WritePrivateProfileStringW(L"Mouse",L"MouseCameraSensitivity",v,ini);
+}
+static void LoadSensitivity() {
+    wchar_t ini[MAX_PATH],v[32]; setup::IniPath(ini); GetPrivateProfileStringW(L"Mouse",L"MouseCameraSensitivity",L"1.0",v,32,ini);
+    mouseSensitivity=ClampSensitivity((float)_wtof(v)); LogF("Mouse camera sensitivity: %.2fx (F3 to change)",mouseSensitivity.load());
+}
+static float StepSensitivity(float s,int steps) {return ClampSensitivity(std::round(s*100.0f+steps)/100.0f);}   // exact 0.01 grid, no float drift
+static void ShowSensitivity(HWND h,float s) {
+    s=ClampSensitivity(s); mouseSensitivity=s;
+    SetScrollPos(GetDlgItem(h,PanelBar),SB_CTL,(int)(s*100+0.5f),TRUE);
+    wchar_t t[64]; swprintf_s(t,L"Mouse camera sensitivity: %.2fx",s); SetDlgItemTextW(h,PanelText,t);
+}
+static void ClosePanel(HWND h) {
+    if(!IsWindowVisible(h)) return;
+    KillTimer(h,PanelTimer); ShowWindow(h,SW_HIDE); sensitivityPanelOpen=false; SaveSensitivity();
+    LogF("Sensitivity panel closed: %.2fx saved",mouseSensitivity.load());
+}
+static void OpenPanel(HWND h) {
+    const int display=deviceDisplay[DevKeyboard]?deviceDisplay[DevKeyboard]-1:0;
+    RECT area; HWND over=views[display]&&IsWindowVisible(views[display])?views[display]:gameWindow;
+    if(!over||!GetWindowRect(over,&area)) {MONITORINFO mi={sizeof(mi)}; GetMonitorInfoW(MonitorFromPoint({0,0},MONITOR_DEFAULTTOPRIMARY),&mi); area=mi.rcWork;}
+    RECT r; GetWindowRect(h,&r); const int w=r.right-r.left,ht=r.bottom-r.top;
+    SetWindowPos(h,HWND_TOPMOST,(area.left+area.right-w)/2,(area.top+area.bottom-ht)/2,0,0,SWP_NOSIZE|SWP_NOACTIVATE|SWP_SHOWWINDOW);
+    for(int k:{VK_LEFT,VK_RIGHT,(int)'A',(int)'D',(int)'R',VK_ESCAPE}) GetAsyncKeyState(k);   // drop presses made before opening
+    ShowSensitivity(h,mouseSensitivity.load()); sensitivityPanelOpen=true; SetTimer(h,PanelTimer,15,nullptr);
+    LogF("Sensitivity panel opened on Display %d: %.2fx",display+1,mouseSensitivity.load());
+}
+static void PanelKeys(HWND h) {
+    static DWORD heldSince=0,lastStep=0;
+    const auto down=[](int k){return (GetAsyncKeyState(k)&0x8000)!=0;};
+    if(GetAsyncKeyState(VK_ESCAPE)&1) {ClosePanel(h); return;}
+    if(GetAsyncKeyState('R')&1) {ShowSensitivity(h,1.0f); SaveSensitivity(); return;}
+    const int dir=(down(VK_RIGHT)||down('D'))-(down(VK_LEFT)||down('A'));
+    const DWORD now=GetTickCount();
+    if(!dir) {heldSince=0; return;}
+    if(!heldSince) heldSince=now;                                  // first press: one step
+    else if(now-heldSince<400||now-lastStep<40) return;            // held: repeat after 0.4 s, 25 steps/s
+    lastStep=now; ShowSensitivity(h,StepSensitivity(mouseSensitivity.load(),dir)); SaveSensitivity();
+}
+static LRESULT CALLBACK PanelProc(HWND h,UINT msg,WPARAM w,LPARAM l) {
+    switch(msg) {
+    case PanelToggle: if(IsWindowVisible(h)) ClosePanel(h); else OpenPanel(h); return 0;
+    case WM_TIMER: if(w==PanelTimer) PanelKeys(h); return 0;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATEANDEAT;
+    case WM_NCHITTEST: return HTTRANSPARENT;                       // mouse goes past it, not into it
+    case WM_CLOSE: ClosePanel(h); return 0;
+    }
+    return DefWindowProcW(h,msg,w,l);
+}
+static DWORD WINAPI PanelLoop(void*) {
+    WNDCLASSW wc={}; wc.lpfnWndProc=PanelProc; wc.hInstance=selfModule; wc.lpszClassName=L"Rev2DualWindowsSensitivity";
+    wc.hCursor=LoadCursor(nullptr,IDC_ARROW); wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1); RegisterClassW(&wc);
+    const DWORD ex=WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE;
+    RECT r={0,0,356,84}; AdjustWindowRectEx(&r,WS_POPUP|WS_CAPTION,FALSE,ex);
+    HWND h=CreateWindowExW(ex,wc.lpszClassName,L"Dual Windows: mouse camera (F3)",WS_POPUP|WS_CAPTION,
+                           0,0,r.right-r.left,r.bottom-r.top,nullptr,nullptr,selfModule,nullptr);
+    if(!h) {Log("Sensitivity panel: window not created"); return 1;}
+    const HFONT font=(HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    const struct {const wchar_t* cls; const wchar_t* text; DWORD style; int x,y,w,ht,id;} items[]={
+        {L"STATIC",L"",SS_LEFT,12,10,332,18,PanelText},
+        {L"SCROLLBAR",L"",SBS_HORZ|WS_DISABLED,12,32,332,18,PanelBar},
+        {L"STATIC",L"Left/Right or A/D: 0.01 (hold to repeat). R: reset. Esc or F3: close.",SS_LEFT,12,58,332,18,0}};
+    for(auto& it:items) {
+        HWND c=CreateWindowExW(0,it.cls,it.text,WS_CHILD|WS_VISIBLE|it.style,it.x,it.y,it.w,it.ht,h,(HMENU)(INT_PTR)it.id,selfModule,nullptr);
+        if(c) SendMessageW(c,WM_SETFONT,(WPARAM)font,TRUE);
+    }
+    SetScrollRange(GetDlgItem(h,PanelBar),SB_CTL,10,300,FALSE);
+    sensitivityPanel=h; OpenPanel(h);
+    MSG msg;
+    while(GetMessageW(&msg,nullptr,0,0)>0) {TranslateMessage(&msg); DispatchMessageW(&msg);}
+    return 0;
+}
+static void ToggleSensitivityPanel() {
+    if(HWND h=sensitivityPanel.load()) {PostMessageW(h,PanelToggle,0,0); return;}
+    static LONG starting=0; if(InterlockedExchange(&starting,1)) return;
+    if(HANDLE t=CreateThread(nullptr,0,PanelLoop,nullptr,0,nullptr)) CloseHandle(t);
+}
 static void KeyboardForMainOnly() {
     if(!deviceDisplay[DevKeyboard]) {Log("Mouse + keyboard not assigned: co-op input unchanged");return;}
     gameBase=(BYTE*)GetModuleHandleW(nullptr);
@@ -842,6 +1345,33 @@ static void KeyboardForMainOnly() {
     Jump(idle,(void*)ModeIdleStub,0xe9,5);
     Log("Co-op mouse + keyboard: per-player input mode hook on");
     PerPlayerInteractions();
+    MenuChecksForKeyboardPlayer();
+    PerPlayerMenus();
+}
+// ---- WM_PAINT freeze (decompiled + hang dump, 2026-11-12) ----
+// The game window procedure answers WM_PAINT (switch case at exe+0x874095) with exe+0x8ca8f0, which calls
+// device->Present on the MAIN thread while the render thread presents every frame. Moving, filling or
+// minimizing the player windows (Ctrl+1/2, Ctrl+Alt+1/2, Alt+Tab) invalidates the game window; the main thread
+// handles that WM_PAINT when it pumps messages, i.e. during loading screens. The hang dump showed the main
+// thread there, inside DrawViews waiting for the Direct3D device lock, while the render thread was inside a
+// player-window Present that never returned. While the player windows are shown they cover the game window
+// and the render thread repaints it every frame, so this extra main-thread Present is skipped (the game still
+// validates the window with BeginPaint/EndPaint, so no WM_PAINT storm). With F8 (windows off) it runs as before.
+using RepaintFn=void (__fastcall*)(void*,void*);
+static RepaintFn realRepaint;
+static void __fastcall HookRepaint(void* self,void* edx) {
+    if(uiReady.load()&&enabled.load()) {
+        static bool logged=false; if(!logged) {logged=true; Log("WM_PAINT present on the main thread skipped (player windows shown)");}
+        return;
+    }
+    realRepaint(self,edx);
+}
+static void SkipPaintPresent() {
+    BYTE* at=(BYTE*)GetModuleHandleW(nullptr)+0x8ca8f0;
+    static const BYTE bytes[]={0x56,0x8b,0xf1,0x8b,0x8e,0x98,0x00,0x00,0x00,0x85,0xc9};
+    if(memcmp(at,bytes,sizeof(bytes))) {Log("WM_PAINT present: game code differs, not hooked");return;}
+    if(MH_CreateHook(at,HookRepaint,(void**)&realRepaint)!=MH_OK||MH_EnableHook(at)!=MH_OK) {Log("WM_PAINT present: hook failed");return;}
+    Log("WM_PAINT present hook on");
 }
 // ---- Mouse + keyboard keep working when the game window loses focus (decompiled) ----
 // The window-active flag [[0x15df9cc]+0x2551] is cleared on deactivate (exe+0x876415). While it is 0:
@@ -858,7 +1388,11 @@ static DeviceStateFn realDeviceState=nullptr;
 static void* keyboardDevice=nullptr;
 static HRESULT WINAPI HookDeviceState(void* dev,DWORD size,void* data) {
     const HRESULT hr=realDeviceState(dev,size,data);
-    if(SUCCEEDED(hr)&&dev==keyboardDevice&&size==256&&data) ((BYTE*)data)[0x3b]=0;   // DIK_F1
+    if(FAILED(hr)||!data) return hr;
+    if(dev==keyboardDevice&&size==256) {
+        ((BYTE*)data)[0x3b]=((BYTE*)data)[0x3d]=0;   // DIK_F1, DIK_F3 (mod keys)
+        if(sensitivityPanelOpen.load()) memset(data,0,size);   // F3 panel open: keys go to the panel only
+    } else if(sensitivityPanelOpen.load()&&(size==16||size==20)) memset(data,0,size);   // DIMOUSESTATE(2): no camera turn while using the panel
     return hr;
 }
 static void FocusFreeInput() {
@@ -887,19 +1421,39 @@ static void FocusFreeInput() {
 }
 // Once a second, logs what the game's input actually holds (only when it changes).
 static void LogInputState() {
-    static DWORD last=0; static unsigned moved=0,prev[10]={~0u};
+    static DWORD last=0; static unsigned moved=0,prev[11]={~0u};
     BYTE* base=(BYTE*)GetModuleHandleW(nullptr);
     uintptr_t mouse=0,input=0,game=0,pad=BioPad(); int dxy[2]={0,0};
     if(ReadPtr((uintptr_t)base+0x11de940,mouse)&&ReadGame(mouse+0x2c,dxy,8)&&(dxy[0]||dxy[1])) moved=1;
     const DWORD now=GetTickCount(); if(now-last<1000) return; last=now;
-    unsigned v[10]={0}; v[5]=moved; moved=0; v[8]=(unsigned)RegionXInput(0); v[9]=(unsigned)RegionXInput(1);
+    unsigned v[11]={0}; v[5]=moved; if(mouse) ReadGame(mouse+0x29,&v[10],1);   // 1 = mouse captured (no menu cursor)
+    moved=0; v[8]=(unsigned)RegionXInput(0); v[9]=(unsigned)RegionXInput(1);
     if(ReadPtr((uintptr_t)base+0x117d120,input)) {ReadGame(input+0x15c4bc,&v[0],4);ReadGame(input+0x15c4c0,&v[1],4);}
     if(pad) {ReadGame(pad+0xba0,&v[2],4);ReadGame(pad+0xba4,&v[3],4);}
     if(ReadPtr((uintptr_t)base+0x117ae00,game)) ReadGame(game+0x7a8,&v[4],4);
     v[6]=GetForegroundWindow()==gameWindow; v[7]=CoopOn();
+    // Pad slots, connected controllers and the join request, logged when they change (controller-only co-op).
+    {
+        static char lastSlots[200];
+        char slots[200]; int n=snprintf(slots,sizeof(slots),"Pad slots:");
+        for(int s=0;s<4;++s) {
+            BYTE used=0,type=0; DWORD index=0; const uintptr_t at=pad+0x3c+s*0x2cc;
+            if(!pad||!ReadGame(at+4,&used,1)||!ReadGame(at+7,&type,1)||!ReadGame(at+0x10,&index,4)||!used||!type) n+=snprintf(slots+n,sizeof(slots)-n," %d=none",s);
+            else if(type==2) n+=snprintf(slots+n,sizeof(slots)-n," %d=DirectInput",s);
+            else n+=snprintf(slots+n,sizeof(slots)-n," %d=XInput%lu",s,index);
+        }
+        static unsigned connected=0,tick=0; PadState st;   // empty XInput numbers are slow to ask: every 5 s
+        if(tick++%5==0) {connected=0; for(DWORD p=0;p<4&&realGetState;++p) if(realGetState(p,&st)==ERROR_SUCCESS) connected|=1u<<p;}
+        uintptr_t area=0; int join=-1; if(ReadPtr((uintptr_t)base+0x11de720,area)) ReadGame(area+0x3898,&join,4);
+        n+=snprintf(slots+n,sizeof(slots)-n,"; controllers on XInput %x; join pad %d",connected,join);
+        if(strcmp(slots,lastSlots)) {
+            strcpy(lastSlots,slots); LogF("%s",slots);
+            if(connected&0xc) Log("  -> a controller on XInput 2 or 3 is connected: the dashboard only places XInput 0 and 1");
+        }
+    }
     if(!memcmp(v,prev,sizeof(v))) return; memcpy(prev,v,sizeof(v));
-    char line[240]; snprintf(line,sizeof(line),"Input: mode=%u/%u mainPad=%d subPad=%d mainChar=%u mouseMoved=%u focus=%u coop=%u region0XInput=%d region1XInput=%d swap=%u",
-        v[0],v[1],(int)v[2],(int)v[3],v[4],v[5],v[6],v[7],(int)v[8],(int)v[9],(unsigned)swapPlayers.load());
+    char line[260]; snprintf(line,sizeof(line),"Input: mode=%u/%u mainPad=%d subPad=%d mainChar=%u mouseMoved=%u focus=%u coop=%u region0XInput=%d region1XInput=%d swap=%u mouseCaptured=%u",
+        v[0],v[1],(int)v[2],(int)v[3],v[4],v[5],v[6],v[7],(int)v[8],(int)v[9],(unsigned)swapPlayers.load(),v[10]);
     Log(line);
 }
 // F2 does what the game's co-op menu does once Player 2 is picked (exe+0x8b952b and exe+0xa908a3):
@@ -922,6 +1476,65 @@ static void ForceCoop() {
     *(int*)(object+0x6e0)=pad; *(int*)(object+0x6e4)=0; *(int*)(object+0x6dc)=1;
     Log("F2: co-op join requested for pad %u (partner state %u)",pad,state);
 }
+// ---- ERR09 at startup with a resolution taller than the desktop (decompiled 2026-11-12) ----
+// The game sizes its window from config.ini [DISPLAY] Resolution (exe+0x875bb1: "WxH", default 1280x720, clamped
+// to 640..8192 x 480..8192), then takes the back buffer size from that window's client area (GetClientRect at
+// exe+0x8c9801 -> render+0xb8/0xbc -> CreateDevice). Windows limits a window to the desktop, so 3840x2160 on two
+// 1920x1080 monitors became a 3840x1100 device. The game then queued a mode change to 3840x2160 (exe+0x8c9b4d),
+// applied only once its window is active (exe+0x87551a -> exe+0x8cad80), a few seconds into startup. That real
+// Reset returned D3DERR_INVALIDCALL and the game's check exe+0x8c5690 showed "ERR09 : Unsupported function".
+// Now the game gets the size it gave its window, so the device starts at the configured resolution and the startup
+// mode change has nothing to change (skipped as "same windowed mode", like every 1920x1080 start).
+static void GameResolution(const char* text,LONG& w,LONG& h) {   // the game's parsing: strtok(" _-a-zA-Z") + atoi
+    auto cut=[](char c){return c==' '||c=='_'||c=='-'||(c>='a'&&c<='z')||(c>='A'&&c<='Z');};
+    LONG v[2]={1280,720}; int n=0;
+    for(const char* p=text;p&&*p&&n<2;) {
+        if(cut(*p)) {++p;continue;}
+        v[n++]=atoi(p); while(*p&&!cut(*p)) ++p;
+    }
+    w=std::clamp<LONG>(v[0],640,8192); h=std::clamp<LONG>(v[1],480,8192);
+}
+static void** gameClientRectSlot;   // the game's own import slot, so any other hook on GetClientRect still runs
+static BOOL WINAPI DeviceClientRect(HWND window,RECT* r) {
+    if(!((BOOL (WINAPI*)(HWND,RECT*))*gameClientRectSlot)(window,r)) return FALSE;
+    const char* ini=(const char*)(gameBase+0x113e514);   // config.ini path inside the game's config object (exe+0x113e510)
+    const size_t n=strnlen(ini,MAX_PATH);
+    if(n<10||n>=MAX_PATH||_stricmp(ini+n-10,"config.ini")) {Log("Game config path not found: back buffer follows the window");return TRUE;}
+    char text[64]={}; GetPrivateProfileStringA("DISPLAY","Resolution","1280x720",text,sizeof(text),ini);
+    LONG w,h; GameResolution(text,w,h);
+    LogF("Game back buffer: window client %ldx%ld, configured resolution %ldx%ld",r->right-r->left,r->bottom-r->top,w,h);
+    if(r->right-r->left!=w||r->bottom-r->top!=h) {
+        *r={0,0,w,h};
+        Log("Back buffer uses the configured resolution (Windows had limited the window): no startup device reset needed");
+    }
+    return TRUE;
+}
+// Diagnostics: every failed Direct3D call the game checks. exe+0x8c5690 (thiscall: result, context; ret 8) turns
+// D3DERR_INVALIDCALL into "ERR09 : Unsupported function" and other results into their own error dialogs.
+#ifdef _MSC_VER
+#include <intrin.h>
+#define CallerAddress() _ReturnAddress()
+#else
+#define CallerAddress() __builtin_return_address(0)
+#endif
+using CheckD3DFn=int (__fastcall*)(void*,void*,HRESULT,const char*);
+static CheckD3DFn realCheckD3D;
+static int __fastcall HookCheckD3D(void* self,void* edx,HRESULT hr,const char* where) {
+    static int logged=0;
+    if(FAILED(hr)&&logged<50) {++logged;
+        LogF("GAME DIRECT3D ERROR %08lx checked at exe+%x (stage: %s); the game shows its error dialog now%s",hr,
+             (unsigned)((BYTE*)CallerAddress()-gameBase),stage.load(),hr==D3DERR_INVALIDCALL?" (ERR09)":"");}
+    return realCheckD3D(self,edx,hr,where);
+}
+static void GameStartupFixes() {
+    gameBase=(BYTE*)GetModuleHandleW(nullptr);
+    BYTE* at=gameBase+0x8c9801; void** slot=(void**)(gameBase+0xe3f36c);
+    if(at[0]==0xff&&at[1]==0x15&&*(void***)(at+2)==slot) {gameClientRectSlot=slot; Jump(at,(void*)DeviceClientRect,0xe8,6); Log("Back buffer size from the configured resolution: on");}
+    else Log("Back buffer size: game code differs, not patched");
+    BYTE* check=gameBase+0x8c5690;
+    if(!memcmp(check,"\x56\x8b\x74\x24\x08\x85\xf6",7)&&MH_CreateHook(check,HookCheckD3D,(void**)&realCheckD3D)==MH_OK) Log("Game Direct3D error log: on");
+    else Log("Game Direct3D error log: game code differs, not hooked");
+}
 // The game creates its device in exclusive fullscreen (its FullScreen=ON); switching to windowed later
 // in Reset sometimes failed and ended in "ERR09: Unsupported function". So it starts windowed instead.
 using CreateDeviceFn=HRESULT (STDMETHODCALLTYPE*)(IDirect3D9*,UINT,D3DDEVTYPE,HWND,DWORD,D3DPRESENT_PARAMETERS*,IDirect3DDevice9**);
@@ -942,7 +1555,7 @@ static DWORD WINAPI Initialize(void*) {
     wchar_t* tail=wcsrchr(logPath,L'.'); if(tail) wcscpy_s(tail,MAX_PATH-(tail-logPath),L".log");
     wchar_t exe[MAX_PATH];GetModuleFileNameW(nullptr,exe,MAX_PATH);
     testMode=wcsstr(exe,L"DualWindowsTest.exe")!=nullptr;
-    Log("DualWindows prototype 0.6.1 initializing");
+    Log("DualWindows prototype 0.6.2 initializing");
     WNDCLASSW wc={};wc.lpfnWndProc=DefWindowProcW;wc.hInstance=selfModule;wc.lpszClassName=L"Rev2DualProbe";
     RegisterClassW(&wc);
     HWND probe=CreateWindowW(wc.lpszClassName,L"",WS_OVERLAPPED,0,0,32,32,nullptr,nullptr,selfModule,nullptr);
@@ -958,6 +1571,14 @@ static DWORD WINAPI Initialize(void*) {
         if(m==MH_OK) CreateMovieDrawHooks(vt);
         if(m==MH_OK) CreateInputSwapHooks();
         if(m==MH_OK&&!testMode&&MH_CreateHook((*(void***)api)[16],HookCreateDevice,(void**)&realCreateDevice)!=MH_OK) Log("CreateDevice hook failed");
+        if(m==MH_OK&&!testMode) GameStartupFixes();   // before the game's render setup (it waits for this thread)
+        IDirect3DSwapChain9* probeChain=nullptr;
+        if(m==MH_OK&&SUCCEEDED(d->GetSwapChain(0,&probeChain))) {
+            BYTE* fn=(BYTE*)(*(void***)probeChain)[3];
+            LogF("Swap-chain Present at %p starts %02x %02x %02x (e9 = already hooked by someone)",(void*)fn,fn[0],fn[1],fn[2]);
+            if(MH_CreateHook(fn,HookChainPresent,(void**)&rawChainPresent)!=MH_OK) {rawChainPresent=nullptr; Log("Swap-chain Present hook failed");}
+            probeChain->Release();
+        }
         if(m==MH_OK && MH_CreateHook(vt[17],HookPresent,(void**)&realPresent)==MH_OK &&
             MH_CreateHook(vt[16],HookReset,(void**)&realReset)==MH_OK && MH_EnableHook(MH_ALL_HOOKS)==MH_OK)
             {Log("D3D9 Present/Reset hooks ready"); stage="hooks ready, waiting for the game's device";}
@@ -995,12 +1616,102 @@ extern "C" __declspec(dllexport) BOOL DualWindowsInputSelfTest() {
     for(int round=0;round<4;++round) {
         swapPlayers=round&1;
         ok&=IsKeyboardPlayer(mainP)==!swapPlayers.load()&&IsKeyboardPlayer(partnerP)==swapPlayers.load();
+        // Menu checks (inventory -> mouse cursor) must use this same player, never the other one.
+        ok&=KeyboardRegionPlayer()==(uintptr_t)(swapPlayers.load()?partnerP:mainP);
     }
+    // Device switching on one display: a new press of one device switches, both at once keep the current one.
+    ok&=NextOnPad(false,true,false)&&!NextOnPad(true,false,true)&&NextOnPad(true,true,true)&&!NextOnPad(false,true,true)&&
+        NextOnPad(true,false,false)&&!NextOnPad(false,false,false);
+    // Dashboard configs A-E (pad index 0 = physical, 1 = Parsec unless noted). Each display's controllers must feed
+    // exactly the character on that display (menus, solo + join, co-op, F1 rounds); mouse + keyboard stays on its display.
+    const int savedDisplay[DevCount]={deviceDisplay[0],deviceDisplay[1],deviceDisplay[2]};
+    struct Config {int kb,p1,p2; unsigned withKeyboard;} configs[]={
+        {1,2,0,0},   // A: D1 mouse+keyboard, D2 physical
+        {1,1,2,1},   // B: D1 mouse+keyboard + physical, D2 Parsec
+        {0,1,2,0},   // C: D1 physical, D2 Parsec
+        {0,2,1,0},   // D: D1 Parsec, D2 physical
+        {1,2,1,2}};  // E: D1 mouse+keyboard + Parsec, D2 physical
+    auto pads=[](DWORD i){DWORD o[2]={9,9};int n=PadsFor(i,o);return n*100+(n>0?o[0]*10:0)+(n>1?o[1]:0);};
+    auto expect=[](int display){int n=0,code=0; for(int p=0;p<2;++p) if(deviceDisplay[DevPad1+p]==display) {code+=n?p:p*10; ++n;} return n*100+code;};
+    for(const Config& c:configs) {
+        deviceDisplay[DevKeyboard]=c.kb; deviceDisplay[DevPad1]=c.p1; deviceDisplay[DevPad2]=c.p2; swapPlayers=false;
+        ok&=PadsWithKeyboard()==c.withKeyboard;
+        fakeRegionX[0]=fakeRegionX[1]=-2;                                   // menus: main slot (XInput 0) = display MainView()+1
+        ok&=pads(0)==expect(MainView()+1)&&pads(1)==expect(2-MainView());
+        for(int x0=0;x0<2;++x0) {
+            fakeRegionX[0]=x0; fakeRegionX[1]=-2;                           // solo: the other display's Start reaches the free XInput
+            ok&=pads(x0)==expect(MainView()+1)&&pads(1-x0)==expect(2-MainView());
+            fakeRegionX[1]=1-x0;                                            // co-op
+            for(int round=0;round<4;++round) {
+                swapPlayers=round&1;
+                const int region1=MainView();                               // region on window 0 = display 1
+                ok&=pads(fakeRegionX[region1])==expect(1)&&pads(fakeRegionX[1-region1])==expect(2);
+                if(c.kb) {
+                    ok&=((swapPlayers.load()?1:0)^MainView())==c.kb-1;   // keyboard player stays on its display
+                    fakeRegionPlayer[0]=(uintptr_t)mainP; fakeRegionPlayer[1]=(uintptr_t)partnerP;
+                    BYTE* kbP=swapPlayers.load()?partnerP:mainP; BYTE* other=kbP==mainP?partnerP:mainP;
+                    for(int onPad=0;onPad<2;++onPad) {                      // the keyboard player's mode follows its device, the other's never
+                        keyboardDisplayOnPad=onPad!=0;
+                        ok&=(IsKeyboardPlayer(kbP)&&KeyboardInUse())==!onPad&&!(IsKeyboardPlayer(other)&&KeyboardInUse());
+                        // Menus: the controller player's inventory never takes mouse + keyboard; the keyboard player's
+                        // takes it only while that display is on mouse + keyboard (its controller always works).
+                        ok&=MenuPadOnly(kbP)==onPad&&MenuPadOnly(other)==1;
+                    }
+                    static BYTE offScreen[0x7930];                          // not on a region / AI partner: game's own input
+                    ok&=MenuPadOnly(offScreen)==-1&&MenuPadOnly(nullptr)==-1;
+                    *(int*)(other+0x7920)=1; ok&=MenuPadOnly(other)==-1; *(int*)(other+0x7920)=0;
+                    keyboardDisplayOnPad=false; fakeRegionPlayer[0]=fakeRegionPlayer[1]=0;
+                }
+            }
+            swapPlayers=false;
+        }
+    }
+    fakeRegionX[0]=fakeRegionX[1]=-2;
+    for(int d=0;d<DevCount;++d) deviceDisplay[d]=savedDisplay[d];
     fakeRegionPlayer[0]=fakeRegionPlayer[1]=0;
+    // ERR09: the back buffer gets the configured resolution, read exactly like the game reads it (exe+0x875bb1).
+    const struct {const char* text; LONG w,h;} res[]={{"3840x2160",3840,2160},{"1920x1080",1920,1080},{"1280 X 720",1280,720},
+        {"",1280,720},{"2560x",2560,720},{"100x100",640,480},{"9000x9000",8192,8192}};
+    for(auto& r:res) {LONG w=0,h=0; GameResolution(r.text,w,h); if(w!=r.w||h!=r.h) {ok=false; LogF("Resolution \"%s\" read as %ldx%ld",r.text,w,h);}}
+    // Menu cursor: every point of a player window's picture reaches its back-buffer pixel; corners reach the
+    // region's corners, points outside the picture stay on its edge (never in the other player's region).
+    {
+        const RECT bottom={0,1080,1920,2160},window={0,0,1280,720},letterbox={0,90,1280,810};
+        auto at=[](const RECT& s,const RECT& d,LONG x,LONG y){return WindowToBackBuffer(s,d,{x,y});};
+        POINT a=at(bottom,window,0,0),b=at(bottom,window,1279,719),c=at(bottom,window,640,360),o=at(bottom,window,-500,5000),t=at(bottom,letterbox,100,0);
+        const bool corners=a.x==0&&a.y==1080&&b.x==1918&&b.y==2158&&c.x==960&&c.y==1620&&o.x==0&&o.y==2158&&t.y==1080;
+        bool stays=true;
+        for(LONG x=-50;x<1400;x+=37) for(LONG y=-50;y<800;y+=29) {POINT p=at(bottom,window,x,y); stays&=p.x>=0&&p.x<1920&&p.y>=1080&&p.y<2160;}
+        bool round=true;   // through the game's own formula (exe+0x8278e8): (client - vp.left) * W / vp width, W = frame width
+        const RECT vps[]={{0,0,3840,2160},{0,0,3840,1100},{10,20,1930,1100}};
+        for(auto& vp:vps) for(LONG px:{0L,1L,960L,1919L,3839L}) {
+            const LONG cx=GameClientFor(px,vp.left,vp.right,3840),cy=GameClientFor(px*9/16,vp.top,vp.bottom,2160);
+            const LONG gx=(LONG)((int64_t)(cx-vp.left)*3840/(vp.right-vp.left)),gy=(LONG)((int64_t)(cy-vp.top)*2160/(vp.bottom-vp.top));
+            round&=abs(gx-px)<=3&&abs(gy-px*9/16)<=3;
+        }
+        if(!corners||!stays||!round) {ok=false; LogF("Menu cursor mapping failed: corners %u, stays %u, round trip %u",corners,stays,round);}
+    }
+    // Mouse camera sensitivity: exact at 1.0x, fractions kept (0.1x of 3 per frame = 30 over 100 frames), clamped.
+    {
+        float rest=0; int sum=0; for(int k=0;k<100;++k) sum+=ScaleDelta(3,0.1f,rest);
+        float r1=0; const bool same=ScaleDelta(7,1.0f,r1)==7&&ScaleDelta(-5,1.0f,r1)==-5&&r1==0.0f;
+        float r2=0; const bool twice=ScaleDelta(-5,2.0f,r2)==-10;
+        const bool clamp=ClampSensitivity(0.0f)==0.1f&&ClampSensitivity(5.0f)==3.0f&&ClampSensitivity(0.0f/0.0f)==1.0f&&ClampSensitivity(1.5f)==1.5f;
+        float k=1.0f; for(int i=0;i<100;++i) k=StepSensitivity(k,1);   // F3: 100 presses of 0.01 land exactly on 2.00
+        const bool steps=k==2.0f&&StepSensitivity(1.0f,-1)==0.99f&&StepSensitivity(0.1f,-1)==0.1f&&StepSensitivity(3.0f,1)==3.0f;
+        if(!steps) {ok=false; LogF("F3 step failed: 100 steps from 1.00 gave %.4f",k);}
+        if(sum<29||sum>30||!same||!twice||!clamp) {ok=false; LogF("Sensitivity scaling failed: sum %d, same %u, twice %u, clamp %u",sum,same,twice,clamp);}
+    }
+    // Inventory button: decided by the player being built when human, never by the other character.
+    {
+        static BYTE human[0x7930],ai[0x7930],first[0x7930]; *(int*)(ai+0x7920)=1;
+        if(GatePlayer(human,first)!=human||GatePlayer(ai,first)!=first||GatePlayer(nullptr,first)!=first) {ok=false; Log("Inventory gate choice failed");}
+    }
     swapPlayers=swap; return ok;
 }
 extern "C" __declspec(dllexport) void DualWindowsShowSetup() {wcscpy_s(logPath,L"DualWindowsSetupTest.log");ShowInputSetup();}
 extern "C" __declspec(dllexport) UINT DualWindowsStats() {return successes;}
+extern "C" __declspec(dllexport) UINT DualWindowsChainCreates() {return chainCreates;}
 extern "C" __declspec(dllexport) UINT DualWindowsFrames() {return frames;}
 extern "C" __declspec(dllexport) UINT DualWindowsPixels() {return pixelChecks;}
 extern "C" __declspec(dllexport) void DualWindowsTestMovie() {if(testMode)movieDrawn.store(true);}

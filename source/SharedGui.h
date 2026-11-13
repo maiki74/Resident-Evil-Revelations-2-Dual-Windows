@@ -5,9 +5,8 @@ static IDirect3DPixelShader9* sharedShader=nullptr;
 static D3DSURFACE_DESC sharedDesc{};
 
 static void ReleaseSharedGui() {
-    if(sharedLayer) sharedLayer->Release();
+    ReleaseNow(sharedLayer,"Shared menu layer");
     if(sharedShader) sharedShader->Release();
-    sharedLayer=nullptr;
     sharedShader=nullptr;
     sharedDesc={};
 }

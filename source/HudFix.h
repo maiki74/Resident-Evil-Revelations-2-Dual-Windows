@@ -47,6 +47,9 @@ static void __fastcall FitHud(uintptr_t object,int mode,uintptr_t context) {
         constants[3]=constants[3]*0.5f+0.5f;
         sharedGuiDrawn.store(true);
     }
+    // uGUIHealNum (herb count) stays native while uGUIEquip is fitted, so it sat on the weapon/sub-item box.
+    // Raise only it, by 0.18 of the half-height (~97 px in a 1080p window), in co-op player windows.
+    if(nativeHeal&&constants&&table==executable+0xf9baf0) constants[3]+=0.18f;
     if(adjust&&constants&&width>0&&height>0) {
         const float fit=std::min(1.0f,(float(width)/height)/(800.0f/360.0f));
         if(std::isfinite(fit)&&fit>0) {

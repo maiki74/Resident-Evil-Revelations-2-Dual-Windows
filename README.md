@@ -9,6 +9,17 @@
 >
 > Use it at your own risk. **Back up your saves** before playing. Please report every bug in [Issues](../../issues) with your log file.
 
+## NEW in v0.6.2
+
+- **Each player's menus take only that player's devices.** Mouse + keyboard no longer moves or uses items in the controller player's inventory.
+- **The mouse cursor reaches the whole inventory and the key-binding menu** (before, only a small area on the left worked).
+- **One player aiming no longer blocks the other player's inventory and healing.**
+- **F3: mouse camera sensitivity.** Left/Right arrows or A/D change it by 0.01 (hold to repeat), R resets, Esc or F3 closes. 0.10x to 3.00x, saved. Only the mouse camera and aiming change.
+- **The herb (healing item) count no longer sits on top of the weapon box.**
+- **Several causes of loading-screen freezes fixed**, plus "ERR09" at startup with very high resolutions.
+
+See [CHANGELOG.md](CHANGELOG.md) for every detail.
+
 ## Full mouse + keyboard and controller support on separate screens
 
 **Two people can play Resident Evil Revelations 2 local co-op at the same time: one on mouse + keyboard, the other on a controller, each on their own window or screen.**
@@ -20,17 +31,21 @@
 | Move, aim, shoot, melee | ✅ independent | ✅ independent |
 | Pick up items, open doors, climb ladders | ✅ own device | ✅ own device |
 | Button prompts | Keyboard keys | Controller buttons |
+| Inventory, map and pause menus | ✅ own device only | ✅ own device only |
+| Healing and inventory while the other player aims | ✅ | ✅ |
 
 - Each device controls **only** the player on its own display.
 - Each screen shows the **correct button prompts** for its device.
 - **F1** swaps characters. Each person keeps their own device and their own screen.
+- **F3** sets the mouse camera sensitivity (0.10x to 3.00x, steps of 0.01, keyboard only).
+- The mouse cursor reaches every part of the inventory and the key-binding menu.
 - A **controls dashboard** at game start lets you drag devices onto Display 1 or Display 2. Your last layout is saved.
 
 Download the ready-to-use mod from **[Releases](../../releases/latest)** or from **[Nexus Mods](https://www.nexusmods.com/residentevilrevelations2/mods/229)**. You don't need to compile anything.
 
 > [!WARNING]
 > **Known issue: the game may freeze when minimized.**
-> Minimizing the game during loading screens or certain gameplay sections may make it stop responding, and you then have to close and restart it. **This is not fixed yet.**
+> Minimizing the game during loading screens or certain gameplay sections could make it stop responding, and you then had to close and restart it. v0.6.2 fixes several causes found in freeze dumps, but **this is not confirmed fixed yet.**
 > Avoid minimizing during loading screens and, when possible, during gameplay.
 >
 > **Help us fix it:** since v0.6.1 the mod saves where a frozen game got stuck. Wait about 15 seconds before closing the frozen game, then attach `scripts\ResidentEvilRevelations2.DualWindows.log` and `scripts\ResidentEvilRevelations2.DualWindows.hang1.dmp` to an [issue](../../issues).
@@ -43,6 +58,7 @@ Revelations 2's local co-op squeezes both players into an uneven split screen. D
 - Player HUD fitted to each window; subtitles and menus shared in both
 - Cutscenes shown full-frame in both windows
 - Chest lock puzzle and healing gauge use the centered single-player layout
+- Herb count moved above the weapon box in each player window
 
 ## Requirements
 
@@ -55,7 +71,7 @@ Revelations 2's local co-op squeezes both players into an uneven split screen. D
 
 1. Install FusionFix in the game folder, next to `rerev2.exe` (Steam: **Manage → Browse local files**).
 2. Start the game once and quit normally, so it creates its settings file.
-3. Download `RE2-DualWindows-v0.6.1.zip` from [Releases](../../releases/latest), extract it to its own folder and run **Install.cmd**.
+3. Download `RE2-DualWindows-v0.6.2.zip` from [Releases](../../releases/latest), extract it to its own folder and run **Install.cmd**.
 4. Start the game through Steam. The controls dashboard opens first: drag **Mouse + keyboard** onto one display and your **controller** onto the other, then press **Start game**.
 
 ## Hotkeys (with the game active)
@@ -64,6 +80,7 @@ Revelations 2's local co-op squeezes both players into an uneven split screen. D
 |---|---|
 | F1 | Swap characters (devices stay on their screens) |
 | F2 | Start co-op during a level |
+| F3 | Mouse camera sensitivity panel (Left/Right or A/D: 0.01 per press, R: reset, Esc/F3: close) |
 | Ctrl+1 / Ctrl+2 | Fill or restore a player's window |
 | Ctrl+Shift+1 / 2 | Cycle output sizes |
 | Ctrl+Alt+1 / 2 | Move a window to the next monitor |
@@ -95,7 +112,7 @@ build-zig.cmd "C:\path\to\zig.exe"
 
 Both produce:
 - `ResidentEvilRevelations2.DualWindows.asi`: the mod. Copy it to `<game>\scripts\`, or put it next to `Install.ps1` and run `Install.cmd`.
-- `DualWindowsTest.exe`: an offline self-test. Run it from `source`; exit code 0 means PASS. It checks the input routing rules (both dashboard layouts, F1 swaps) and the window/graphics pipeline with a dummy Direct3D 9 device. It does not start the game.
+- `DualWindowsTest.exe`: an offline self-test. Run it from `source`; exit code 0 means PASS. It checks the input routing rules (both dashboard layouts, F1 swaps, per-player menus, menu cursor mapping, sensitivity steps, inventory gate) and the window/graphics pipeline with a dummy Direct3D 9 device. It does not start the game.
 
 The only third-party code is [MinHook](https://github.com/TsudaKageyu/minhook) (BSD 2-Clause), included in `source/minhook`.
 
@@ -105,7 +122,7 @@ The only third-party code is [MinHook](https://github.com/TsudaKageyu/minhook) (
 |---|---|
 | `source/DualWindows.cpp` | Entry point. Direct3D 9 hooks that copy each player's viewport into its own window, window management and hotkeys, F1 swap, and per-player input mode hooks (movement, actions, interactions, button prompts) |
 | `source/InputSetup.h` | The controls dashboard (plain Win32/GDI), the saved layout, and XInput routing: which physical controller feeds which in-game player, based on what each display shows |
-| `source/HudFix.h` | Fits the player HUD to each 16:9 window |
+| `source/HudFix.h` | Fits the player HUD to each 16:9 window, and moves the herb count above the weapon box |
 | `source/SharedGui.h` | Draws shared menus and subtitles into both windows |
 | `source/MovieFrames.h` | Shows prerecorded cutscenes full-frame |
 | `source/Diagnostics.h` | Startup/monitor logging and the freeze watchdog (logs the stuck thread's stack and writes a small dump) |

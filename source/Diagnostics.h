@@ -1,4 +1,4 @@
-// Freeze diagnostics: startup stages, monitors/adapters, and a hang watchdog.
+﻿// Freeze diagnostics: startup stages, monitors/adapters, and a hang watchdog.
 // The watchdog never sends messages to game windows: it only polls IsHungAppWindow once a second.
 // When a window of this process stops responding it logs the stuck thread's stack (return addresses
 // as module+offset), the last stage reached, and writes one minidump next to the log.
@@ -88,8 +88,8 @@ static void WriteHangDump(int number) {
     if(wchar_t* dot=wcsrchr(path,L'.')) swprintf_s(dot,MAX_PATH-(dot-path),L".hang%d.dmp",number);
     HANDLE f=CreateFileW(path,GENERIC_WRITE,0,nullptr,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(f==INVALID_HANDLE_VALUE) {LogF("Hang dump: cannot create file");return;}
-    // MiniDumpNormal | WithUnloadedModules | WithThreadInfo: every thread's stack, small file.
-    const BOOL ok=writeDump(GetCurrentProcess(),GetCurrentProcessId(),f,0x1020,nullptr,nullptr,nullptr);
+    // MiniDumpNormal | WithHandleData | WithUnloadedModules | WithThreadInfo: every thread's stack, small file.
+    const BOOL ok=writeDump(GetCurrentProcess(),GetCurrentProcessId(),f,0x1024,nullptr,nullptr,nullptr);
     CloseHandle(f); LogF("Hang dump %ls: %s",path,ok?"written":"failed");
 }
 struct HungSearch {HWND window; int windows;};
@@ -103,8 +103,20 @@ static BOOL CALLBACK FindHungWindow(HWND h,LPARAM p) {
 static DWORD WINAPI Watchdog(void*) {
     writeDump=(DumpFn)GetProcAddress(LoadLibraryW(L"dbghelp.dll"),"MiniDumpWriteDump");   // load now, not while hung
     int dumps=0; bool reported=false; int monitors=GetSystemMetrics(SM_CMONITORS);
+    UINT lastFrames=0; int stalled=0;
     for(;;) {
         Sleep(1000);
+        // Render stall: windows still respond, but no frame for 15 s (e.g. render thread stuck in Present).
+        const UINT nowFrames=frames;
+        if(nowFrames!=lastFrames||!uiReady.load()||IsIconic(gameWindow)) {
+            if(stalled>=15) LogF("Watchdog: rendering resumed after %d s",stalled);
+            stalled=0; lastFrames=nowFrames;
+        } else if(++stalled==15) {
+            LogF("WATCHDOG: no frame for 15 s while windows respond. stage=%s, render=%s, frames=%u, monitors=%d",
+                 stage.load(),renderSpot.load(),nowFrames,GetSystemMetrics(SM_CMONITORS));
+            LogThreadStack(renderThreadId,"render");
+            if(dumps<2) WriteHangDump(++dumps);
+        }
         const int nowMonitors=GetSystemMetrics(SM_CMONITORS);
         if(nowMonitors!=monitors) {LogF("Monitor count changed: %d -> %d",monitors,nowMonitors); monitors=nowMonitors;}
         HungSearch s={}; EnumWindows(FindHungWindow,(LPARAM)&s);

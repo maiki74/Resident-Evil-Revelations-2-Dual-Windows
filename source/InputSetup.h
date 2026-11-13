@@ -94,13 +94,22 @@ static bool CoopOn() {
     return ReadGame((uintptr_t)GetModuleHandleW(nullptr)+0x117ae00,&game,sizeof(game))&&game&&
            ReadGame(game+0x8f0,&coop,sizeof(coop))&&coop==1;
 }
+static void LogStartPress(DWORD pad,DWORD xinput);
+static void NoteStart(DWORD pad,DWORD xinput,WORD buttons) {   // diagnostics: where each controller's Start goes
+    static WORD was[2]; if(pad>=2) return;
+    if(buttons&~was[pad]&0x0010) LogStartPress(pad,xinput);   // XINPUT_GAMEPAD_START
+    was[pad]=buttons;
+}
 static DWORD MergedState(PadFn real,DWORD i,void* s) {
     DWORD pads[2]; const int n=PadsFor(i,pads);
     bool any=false;
     for(int k=0;k<n;++k) {
-        if(!any) {any=real(pads[k],s)==ERROR_SUCCESS;continue;}
         BYTE extra[64]={};   // GetStateEx may write past XINPUT_STATE
-        if(real(pads[k],extra)==ERROR_SUCCESS) Combine(*(PadState*)s,*(PadState*)extra);
+        void* out=any?(void*)extra:s;
+        if(real(pads[k],out)!=ERROR_SUCCESS) continue;
+        NoteStart(pads[k],i,((PadState*)out)->buttons);
+        if(any) Combine(*(PadState*)s,*(PadState*)extra);
+        any=true;
     }
     // XInput 0 and 1 always look connected (idle when their display has no controller): otherwise the
     // game fills its slots in a different order and the partner's slot ends up empty.
@@ -422,6 +431,17 @@ static HFONT Font(float size,int weight,const wchar_t* face) {
 }
 }
 
+// The join menu (exe+0x8b94f8) takes the first pad SLOT that is not the main slot (sBioPad+0xba0) and has
+// button bit 8; the title screen (exe+0xa96472) makes the slot that pressed Start/A the main slot (keyboard: 0).
+static void LogStartPress(DWORD p,DWORD x) {
+    static unsigned count=0; if(testMode||++count>100) return;
+    const uintptr_t pad=BioPad(); int slot=-1, number[2]={-1,-1};
+    for(int s=0;pad&&s<4;++s) if(SlotXInput(pad,s)==(int)x) {slot=s; break;}
+    if(pad) ReadGame(pad+0xba0,number,sizeof(number));
+    LogF("Start on controller %lu (%ls, display %d) -> game XInput %lu = pad slot %d; main slot %d, partner slot %d, co-op %d%s",
+         p+1,setup::padName[p],deviceDisplay[DevPad1+p],x,slot,number[0],number[1],(int)CoopOn(),
+         slot>=0&&slot==number[0]?" (main slot: the join menu ignores it)":"");
+}
 // Blocks until the player presses Start game. Runs before the game creates its window.
 static void ShowInputSetup() {
     using namespace setup;
